@@ -1,0 +1,96 @@
+# -----------------------------------------
+# data — never commit raw datasets or images
+# -----------------------------------------
+data/flickr30k/
+data/flickr30k-images/
+data/Annotations/
+data/splits/
+# Entities XMLs are small enough to commit if desired,
+# but exclude them by default since they're freely re-cloneable
+data/flickr30k_entities/
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+
+# HuggingFace datasets cache (downloaded automatically by datasets lib)
+~/.cache/huggingface/
+.cache/
+cache/
+*.pt.cache
+
+# -----------------------------------------
+# model weights and checkpoints
+# -----------------------------------------
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# huggingface model downloads
+~/.cache/huggingface/
+
+# -----------------------------------------
+# training runs and logs
+# -----------------------------------------
+runs/
+wandb/
+lightning_logs/
+*.tfevents.*
+
+# -----------------------------------------
+# python
+# -----------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+
+# virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# -----------------------------------------
+# jupyter
+# -----------------------------------------
+.ipynb_checkpoints/
+*.ipynb
+
+# -----------------------------------------
+# os / editor
+# -----------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# -----------------------------------------
+# outputs — keep structure, not content
+# -----------------------------------------
+eval/visualizations/
+demo/examples/
+*.pdf
+*.csv
+
+# exception: keep placeholder files so dirs are tracked
+!.gitkeep

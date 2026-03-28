@@ -1,0 +1,181 @@
+"""
+eval/metrics.py — grounding evaluation metrics.
+
+MEMBER C owns this file.
+
+Primary metric : Acc@0.5  — fraction of phrases where predicted proposal
+                            has IoU >= 0.5 with ground-truth box.
+                            Standard benchmark number on Flickr30k Entities.
+
+Secondary      : Acc@0.25 — same at a looser threshold (useful for ablations).
+               : mean_iou — average IoU across all phrases.
+               : acc_by_type — Acc@0.5 broken down by Flickr30k entity_type
+                               (people, animals, vehicles, clothing, instruments,
+                                scene, other).
+
+Usage:
+    evaluator = GroundingEvaluator(config)
+    # inside eval loop:
+    evaluator.update_from_indices(preds, proposals, gt_boxes, entity_types)
+    results = evaluator.compute()
+    evaluator.reset()
+
+    # track CLIP baseline for delta reporting:
+    evaluator.set_baseline(baseline_acc)
+"""
+
+from collections import defaultdict
+from typing import Dict, List, Optional
+
+import torch
+
+from config import Config
+
+
+# ---------------------------------------------------------------------------
+# Standalone IoU helper (imported by other modules too)
+# ---------------------------------------------------------------------------
+
+def iou(box_a: torch.Tensor, box_b: torch.Tensor) -> float:
+    """
+    Compute IoU between two axis-aligned boxes [x1, y1, x2, y2].
+
+    Handles degenerate boxes (zero area) gracefully — returns 0.0.
+    Both tensors must be 1-D with 4 elements.
+    """
+    xa = max(box_a[0].item(), box_b[0].item())
+    ya = max(box_a[1].item(), box_b[1].item())
+    xb = min(box_a[2].item(), box_b[2].item())
+    yb = min(box_a[3].item(), box_b[3].item())
+
+    inter    = max(0.0, xb - xa) * max(0.0, yb - ya)
+    area_a   = max(0.0, float((box_a[2] - box_a[0]) * (box_a[3] - box_a[1])))
+    area_b   = max(0.0, float((box_b[2] - box_b[0]) * (box_b[3] - box_b[1])))
+    union    = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Evaluator
+# ---------------------------------------------------------------------------
+
+class GroundingEvaluator:
+    """
+    Stateful accumulator for grounding metrics.
+
+    Call update_from_indices() (or update()) for each batch,
+    then compute() at the end of the epoch, then reset() before the next.
+    """
+
+    def __init__(self, config: Config):
+        self.cfg            = config
+        self.threshold_high = config.eval.iou_threshold    # 0.5
+        self.threshold_low  = 0.25                         # secondary threshold
+        self._baseline_acc: Optional[float] = None
+        self.reset()
+
+    def reset(self):
+        """Clear all accumulated state. Call before each eval epoch."""
+        self._ious:         List[float] = []
+        self._correct_50:   List[bool]  = []
+        self._correct_25:   List[bool]  = []
+        self._entity_types: List[str]   = []
+
+    def set_baseline(self, baseline_acc: float):
+        """
+        Store the vanilla-CLIP Acc@0.5 so compute() can report delta.
+        Called once after the CLIP baseline run in train.py.
+        """
+        self._baseline_acc = baseline_acc
+
+    # ------------------------------------------------------------------
+    # Update methods
+    # ------------------------------------------------------------------
+
+    def update(self,
+               pred_boxes:   torch.Tensor,   # (B, 4)
+               gt_boxes:     torch.Tensor,   # (B, 4)
+               entity_types: List[str],
+               ):
+        """
+        Accumulate one batch of box-level predictions.
+
+        Args:
+            pred_boxes   : (B, 4) predicted [x1,y1,x2,y2] for each phrase
+            gt_boxes     : (B, 4) ground-truth boxes
+            entity_types : list[str] of length B
+        """
+        for i in range(pred_boxes.size(0)):
+            score = iou(pred_boxes[i], gt_boxes[i])
+            self._ious.append(score)
+            self._correct_50.append(score >= self.threshold_high)
+            self._correct_25.append(score >= self.threshold_low)
+            self._entity_types.append(entity_types[i])
+
+    def update_from_indices(self,
+                            pred_idx:     torch.Tensor,   # (B,)
+                            proposals:    torch.Tensor,   # (B, N, 4)
+                            gt_boxes:     torch.Tensor,   # (B, 4)
+                            entity_types: List[str],
+                            ):
+        """
+        Convert predicted proposal index → box, then call update().
+
+        This is the method called from train.py and evaluate.py.
+        proposals and gt_boxes should both be on CPU before calling.
+        """
+        B         = pred_idx.size(0)
+        pred_idx  = pred_idx.cpu()
+        proposals = proposals.cpu()
+        gt_boxes  = gt_boxes.cpu()
+
+        pred_boxes = proposals[torch.arange(B), pred_idx]   # (B, 4)
+        self.update(pred_boxes, gt_boxes, entity_types)
+
+    # ------------------------------------------------------------------
+    # Compute
+    # ------------------------------------------------------------------
+
+    def compute(self) -> Dict:
+        """
+        Compute and return all metrics over accumulated samples.
+
+        Returns dict with:
+            acc@0.5      : float
+            acc@0.25     : float
+            mean_iou     : float
+            n_samples    : int
+            acc_by_type  : dict[str, float]  — Acc@0.5 per entity type
+            baseline_delta : float | None    — gain vs CLIP baseline if set
+        """
+        if not self._correct_50:
+            return {}
+
+        n            = len(self._correct_50)
+        overall_50   = sum(self._correct_50) / n
+        overall_25   = sum(self._correct_25) / n
+        mean_iou_val = sum(self._ious) / n
+
+        # Per-entity-type Acc@0.5
+        type_buckets: Dict[str, List[bool]] = defaultdict(list)
+        for correct, etype in zip(self._correct_50, self._entity_types):
+            type_buckets[etype].append(correct)
+
+        acc_by_type = {
+            etype: round(sum(cs) / len(cs), 4)
+            for etype, cs in sorted(type_buckets.items())
+        }
+
+        # Delta vs CLIP baseline
+        delta = None
+        if self._baseline_acc is not None:
+            delta = round(overall_50 - self._baseline_acc, 4)
+
+        return {
+            "acc@0.5":        round(overall_50,   4),
+            "acc@0.25":       round(overall_25,   4),
+            "mean_iou":       round(mean_iou_val, 4),
+            "n_samples":      n,
+            "acc_by_type":    acc_by_type,
+            "baseline_delta": delta,
+        }

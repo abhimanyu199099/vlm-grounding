@@ -1,0 +1,175 @@
+"""
+models/grounding_model.py — top-level model: FrozenCLIPEncoder + GroundingHead.
+
+MEMBER B owns this file.
+
+This is the single object instantiated in train.py, evaluate.py, and demo/.
+It owns the encode → score → loss pipeline, and handles device placement,
+checkpoint save/load, and the interface to NegativeMiner.
+
+Key wiring decisions:
+  - GroundingHead is constructed AFTER FrozenCLIPEncoder so that
+    text_hidden_dim and region_proj_dim can be read off the encoder's
+    config rather than hardcoded.
+  - forward() accepts an optional (neg_indices, cross_image) tuple returned
+    by NegativeMiner.mine(). When absent, plain cross-entropy is used.
+  - Only head weights are saved in checkpoints; encoder weights are always
+    re-loaded from HuggingFace.
+"""
+
+from pathlib import Path
+from typing import Optional, Tuple
+
+import torch
+import torch.nn as nn
+
+from config import Config
+from .encoder import FrozenCLIPEncoder
+from .head import GroundingHead, grounding_loss
+
+
+class GroundingModel(nn.Module):
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.cfg     = config
+
+        # Build encoder first — its config attributes tell us the right dims
+        self.encoder = FrozenCLIPEncoder(config)
+
+        # Build head using dims read from the encoder, not from config.model
+        self.head = GroundingHead(
+            config=config,
+            text_hidden_dim=self.encoder.text_hidden_dim,   # 512 for ViT-B/32
+            region_proj_dim=self.encoder.projection_dim,    # 512 for ViT-B/32
+        )
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(self,
+                batch:       dict,
+                neg_mining:  Optional[Tuple[torch.Tensor, bool]] = None,
+                ) -> dict:
+        """
+        Args:
+            batch: dict produced by data.collate_fn with keys:
+                phrase_tokens   : (B, 77)
+                proposal_crops  : (B, N, 3, H, W)
+                proposals       : (B, N, 4)
+                proposal_mask   : (B, N) bool
+                pos_idx         : (B,)
+                gt_box          : (B, 4)
+                image_id        : list[str]
+                phrase          : list[str]
+                entity_type     : list[str]
+
+            neg_mining: optional tuple (neg_indices, cross_image) from
+                NegativeMiner.mine(). Pass None to use plain cross-entropy.
+                    neg_indices  : (B, K) LongTensor
+                    cross_image  : bool
+
+        Returns dict:
+            scores  : (B, N)  — raw grounding logits (padding → -inf)
+            loss    : scalar
+            preds   : (B,)    — argmax predicted proposal index
+            phrase_embeds  : (B, D) — L2-normed phrase embeddings (for miner)
+            region_embeds  : (B, N, D) — L2-normed region embeddings (for miner)
+        """
+        device = next(self.head.parameters()).device
+
+        phrase_tokens  = batch["phrase_tokens"].to(device)        # (B, 77)
+        proposal_crops = batch["proposal_crops"].to(device)       # (B, N, 3, H, W)
+        pos_idx        = batch["pos_idx"].to(device)              # (B,)
+
+        proposal_mask = batch.get("proposal_mask")
+        if proposal_mask is not None:
+            proposal_mask = proposal_mask.to(device)              # (B, N) bool
+
+        # Attention mask: 1 for real tokens, 0 for padding (CLIP pads with 0)
+        attn_mask = (phrase_tokens != 0).to(device)               # (B, 77)
+
+        # ---- Encode (all under no_grad — encoder is frozen) ----
+        text_hidden   = self.encoder.encode_text(phrase_tokens, attn_mask)   # (B, L, D_text)
+        region_embeds = self.encoder.encode_region(proposal_crops)           # (B, N, D_proj)
+
+        # Pooled phrase embeddings for the negative miner (returned in output dict
+        # so train.py can pass them to miner.mine() without a second encoder call)
+        phrase_embeds = self.encoder.encode_phrase(phrase_tokens, attn_mask) # (B, D_proj)
+
+        # ---- Score ----
+        scores = self.head(
+            text_hidden=text_hidden,
+            region_embeds=region_embeds,
+            text_mask=attn_mask,
+            proposal_mask=proposal_mask,
+        )                                                                      # (B, N)
+
+        # ---- Loss ----
+        neg_indices  = None
+        cross_image  = False
+        if neg_mining is not None:
+            neg_indices, cross_image = neg_mining
+            if neg_indices is not None:
+                neg_indices = neg_indices.to(device)
+
+        loss  = grounding_loss(scores, pos_idx, neg_indices, cross_image)
+        preds = scores.argmax(dim=1)                                          # (B,)
+
+        return {
+            "scores":        scores,
+            "loss":          loss,
+            "preds":         preds,
+            "phrase_embeds": phrase_embeds,
+            "region_embeds": region_embeds,
+        }
+
+    # ------------------------------------------------------------------
+    # Checkpoint helpers
+    # ------------------------------------------------------------------
+
+    def save(self, path: Path, epoch: int,
+             optimizer=None, metrics: dict = None):
+        """
+        Save only the trainable head weights.
+        The encoder is frozen and always re-loaded from HuggingFace,
+        so saving it would double checkpoint size for no benefit.
+        """
+        ckpt = {
+            "epoch":      epoch,
+            "head_state": self.head.state_dict(),
+            "config":     self.cfg,
+            "metrics":    metrics or {},
+        }
+        if optimizer is not None:
+            ckpt["optimizer"] = optimizer.state_dict()
+        torch.save(ckpt, path)
+        return ckpt
+
+    def load(self, path: Path, optimizer=None) -> dict:
+        """
+        Load head weights from a checkpoint.
+        Returns the full checkpoint dict (caller can inspect epoch, metrics, etc.).
+        """
+        ckpt = torch.load(path, map_location="cpu")
+        # strict=True by default — will error if architecture changed
+        self.head.load_state_dict(ckpt["head_state"], strict=True)
+        if optimizer is not None and "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        return ckpt
+
+    # ------------------------------------------------------------------
+    # Parameter helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def trainable_parameters(self):
+        """Parameters to pass to the optimizer — head only."""
+        return self.head.trainable_parameters()
+
+    def trainable_param_count(self) -> int:
+        return sum(p.numel() for p in self.trainable_parameters)
+
+    def total_param_count(self) -> int:
+        return sum(p.numel() for p in self.parameters())
