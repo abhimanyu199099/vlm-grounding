@@ -45,12 +45,15 @@ def set_seed(seed: int):
 
 def train_one_epoch(model, loader, optimizer, scaler, miner, evaluator, cfg, epoch):
     model.train()
-    total_loss = 0.0
+    total_loss       = 0.0
+    total_g_loss     = 0.0
+    total_c_loss     = 0.0
+    total_e_loss     = 0.0
 
     for step, batch in enumerate(loader):
         optimizer.zero_grad()
 
-        with autocast(enabled=cfg.train.mixed_precision):
+        with autocast('cuda', enabled=cfg.train.mixed_precision):
             # First forward pass without hard negatives to get embeddings
             out = model(batch, neg_mining=None)
 
@@ -76,11 +79,24 @@ def train_one_epoch(model, loader, optimizer, scaler, miner, evaluator, cfg, epo
         scaler.step(optimizer)
         scaler.update()
 
-        total_loss += loss.item()
+        total_loss   += loss.item()
+        total_g_loss += out["grounding_loss"].item()
+        total_c_loss += out["contrastive_loss"].item()
+        total_e_loss += out["entropy_loss"].item()
 
         if step % cfg.train.log_every == 0:
-            avg = total_loss / (step + 1)
-            print(f"  Epoch {epoch} | step {step}/{len(loader)} | loss {avg:.4f}")
+            n     = step + 1
+            avg   = total_loss   / n
+            avg_g = total_g_loss / n
+            avg_c = total_c_loss / n
+            avg_e = total_e_loss / n
+            print(
+                f"  Epoch {epoch} | step {step}/{len(loader)}"
+                f" | loss {avg:.4f}"
+                f"  (grounding {avg_g:.4f}"
+                f" | contrastive {avg_c:.4f}"
+                f" | entropy {avg_e:.4f})"
+            )
 
     return total_loss / len(loader)
 
@@ -190,7 +206,7 @@ def main(cfg: Config):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.train.epochs
     )
-    scaler    = GradScaler(enabled=cfg.train.mixed_precision)
+    scaler    = GradScaler('cuda', enabled=cfg.train.mixed_precision)
     miner     = NegativeMiner(cfg, clip_model=model.encoder.clip)
     evaluator = GroundingEvaluator(cfg)
 

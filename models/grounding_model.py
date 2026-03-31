@@ -23,9 +23,16 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+import torch.nn.functional as F
+
 from config import Config
 from .encoder import FrozenCLIPEncoder
-from .head import GroundingHead, grounding_loss
+from .head import GroundingHead
+from .losses import (
+    grounding_loss,
+    hard_negative_contrastive_loss,
+    token_entropy_loss,
+)
 
 
 class GroundingModel(nn.Module):
@@ -71,11 +78,15 @@ class GroundingModel(nn.Module):
                     cross_image  : bool
 
         Returns dict:
-            scores  : (B, N)  — raw grounding logits (padding → -inf)
-            loss    : scalar
-            preds   : (B,)    — argmax predicted proposal index
-            phrase_embeds  : (B, D) — L2-normed phrase embeddings (for miner)
-            region_embeds  : (B, N, D) — L2-normed region embeddings (for miner)
+            scores           : (B, N)  — raw grounding logits (padding → -inf)
+            loss             : scalar  — weighted total loss
+            grounding_loss   : scalar  — CE component (detached, for logging)
+            contrastive_loss : scalar  — hard-neg InfoNCE component (detached)
+            entropy_loss     : scalar  — token entropy component (detached)
+            preds            : (B,)    — argmax predicted proposal index
+            token_weights    : (B, L)  — per-token importance weights (detached)
+            phrase_embeds    : (B, D)  — L2-normed phrase embeddings (for miner)
+            region_embeds    : (B, N, D) — L2-normed region embeddings (for miner)
         """
         device = next(self.head.parameters()).device
 
@@ -99,30 +110,62 @@ class GroundingModel(nn.Module):
         phrase_embeds = self.encoder.encode_phrase(phrase_tokens, attn_mask) # (B, D_proj)
 
         # ---- Score ----
-        scores = self.head(
+        # head now returns (scores, token_weights, query)
+        scores, token_weights, query = self.head(
             text_hidden=text_hidden,
             region_embeds=region_embeds,
             text_mask=attn_mask,
             proposal_mask=proposal_mask,
-        )                                                                      # (B, N)
+        )                                                           # (B,N), (B,L), (B,D)
 
-        # ---- Loss ----
-        neg_indices  = None
-        cross_image  = False
+        # ---- Loss 1: grounding loss (CE over proposals) ----
+        neg_indices = None
+        cross_image = False
         if neg_mining is not None:
             neg_indices, cross_image = neg_mining
             if neg_indices is not None:
                 neg_indices = neg_indices.to(device)
 
-        loss  = grounding_loss(scores, pos_idx, neg_indices, cross_image)
-        preds = scores.argmax(dim=1)                                          # (B,)
+        g_loss = grounding_loss(scores, pos_idx, neg_indices, cross_image)
+
+        # ---- Loss 2: hard-negative contrastive loss ----
+        # Use the weighted query as the phrase embedding; normalise both sides.
+        phrase_q      = F.normalize(query, dim=-1)                  # (B, D)
+        region_norm   = F.normalize(region_embeds, dim=-1)          # (B, N, D)
+        cfg_m         = self.cfg.model
+        c_loss = hard_negative_contrastive_loss(
+            phrase_embeds=phrase_q,
+            region_embeds=region_norm,
+            pos_idx=pos_idx,
+            proposal_mask=proposal_mask if proposal_mask is not None
+                          else torch.ones(scores.shape, dtype=torch.bool, device=device),
+            k=cfg_m.hard_neg_k,
+            temperature=cfg_m.contrastive_temperature,
+            penalty_factor=cfg_m.hard_neg_penalty,
+        )
+
+        # ---- Loss 3: token entropy regularisation ----
+        e_loss = token_entropy_loss(token_weights, attn_mask.bool())
+
+        # ---- Combine ----
+        total = (
+            g_loss
+            + cfg_m.contrastive_loss_weight * c_loss
+            + cfg_m.entropy_loss_weight     * e_loss
+        )
+
+        preds = scores.argmax(dim=1)                                # (B,)
 
         return {
-            "scores":        scores,
-            "loss":          loss,
-            "preds":         preds,
-            "phrase_embeds": phrase_embeds,
-            "region_embeds": region_embeds,
+            "scores":           scores,
+            "loss":             total,
+            "grounding_loss":   g_loss.detach(),
+            "contrastive_loss": c_loss.detach(),
+            "entropy_loss":     e_loss.detach(),
+            "preds":            preds,
+            "token_weights":    token_weights.detach(),
+            "phrase_embeds":    phrase_embeds,
+            "region_embeds":    region_embeds,
         }
 
     # ------------------------------------------------------------------

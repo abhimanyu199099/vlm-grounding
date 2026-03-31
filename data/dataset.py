@@ -56,69 +56,64 @@ from config import Config, HF_DATASET_NAME, ENTITIES_ANNO_DIR, CACHE_DIR
 
 def parse_entities_xml(xml_path: Path) -> List[dict]:
     """
-    Parse one Flickr30k Entities XML file.
+    Parse one Flickr30k Entities image annotation + sentence file pair.
+
+    Actual format on disk:
+      Annotations/<img_id>.xml  — bounding boxes, objects keyed by <name> (entity ID)
+      Sentences/<img_id>.txt    — one sentence per line with inline phrase markup:
+                                  [/EN#<id>/<type> phrase text]
 
     Returns list of phrase dicts:
         {"phrase": str, "phrase_id": str, "entity_type": str,
          "boxes": [[x1,y1,x2,y2], ...]}
-
-    XML structure (abridged):
-        <annotation>
-          <object>
-            <object_id>...</object_id>
-            <bndbox><xmin/><ymin/><xmax/><ymax/></bndbox>
-            ...  (multiple bndbox per object)
-          </object>
-          ...
-          <sentence id="...">
-            <phrase id="..." type="...">phrase text</phrase>
-            ...
-          </sentence>
-          ...
-        </annotation>
-
-    Phrase IDs in <phrase> elements match object_id values in <object> elements.
+    Only phrases that have at least one bounding box are returned.
     """
+    import re
+
     if not xml_path.exists():
         return []
 
+    # --- Pass 1: entity_id → boxes from XML ---
     tree = ET.parse(xml_path)
     root = tree.getroot()
 
-    # Pass 1: phrase_id → list of boxes from <object> nodes
     boxes_by_id: Dict[str, List[List[int]]] = {}
     for obj in root.iter("object"):
-        oid_el = obj.find("object_id")
-        if oid_el is None:
+        bndbox = obj.find("bndbox")
+        if bndbox is None:
             continue
-        oid = oid_el.text.strip()
-        for bndbox in obj.findall("bndbox"):
-            try:
-                x1 = int(bndbox.find("xmin").text)
-                y1 = int(bndbox.find("ymin").text)
-                x2 = int(bndbox.find("xmax").text)
-                y2 = int(bndbox.find("ymax").text)
-                boxes_by_id.setdefault(oid, []).append([x1, y1, x2, y2])
-            except (AttributeError, ValueError, TypeError):
-                continue
+        try:
+            x1 = int(bndbox.find("xmin").text)
+            y1 = int(bndbox.find("ymin").text)
+            x2 = int(bndbox.find("xmax").text)
+            y2 = int(bndbox.find("ymax").text)
+        except (AttributeError, ValueError, TypeError):
+            continue
+        for name_el in obj.findall("name"):
+            eid = name_el.text.strip()
+            boxes_by_id.setdefault(eid, []).append([x1, y1, x2, y2])
 
-    # Pass 2: phrase_id → (text, entity_type) from <sentence>/<phrase> nodes
-    phrases = []
-    for sentence in root.findall("sentence"):
-        for phrase_el in sentence.findall("phrase"):
-            pid   = phrase_el.get("id", "").strip()
-            ptype = phrase_el.get("type", "other").strip()
-            text  = (phrase_el.text or "").strip()
-            if not text or pid not in boxes_by_id:
-                continue
-            phrases.append({
-                "phrase":      text,
-                "phrase_id":   pid,
-                "entity_type": ptype,
-                "boxes":       boxes_by_id[pid],
-            })
+    # --- Pass 2: parse phrase text + type from the matching .txt sentences file ---
+    sentences_path = xml_path.parent.parent / "Sentences" / xml_path.name.replace(".xml", ".txt")
+    if not sentences_path.exists():
+        return []
 
-    return phrases
+    # Pattern: [/EN#<id>/<type> phrase text]
+    phrase_re = re.compile(r'\[/EN#(\d+)/(\w+)\s+([^\]]+)\]')
+
+    seen: Dict[str, dict] = {}   # phrase_id → dict (deduplicate across sentences)
+    for line in sentences_path.read_text(encoding="utf-8").splitlines():
+        for m in phrase_re.finditer(line):
+            pid, ptype, text = m.group(1), m.group(2), m.group(3).strip()
+            if pid in boxes_by_id and pid not in seen:
+                seen[pid] = {
+                    "phrase":      text,
+                    "phrase_id":   pid,
+                    "entity_type": ptype,
+                    "boxes":       boxes_by_id[pid],
+                }
+
+    return list(seen.values())
 
 
 # ---------------------------------------------------------------------------
@@ -166,13 +161,27 @@ def get_proposals(image: Image.Image,
             method = "grid"   # fall back silently
 
     if method == "grid":
-        N = 7   # 7×7 = 49 proposals
-        for row in range(N):
-            for col in range(N):
-                proposals.append([
-                    col * W / N,        row * H / N,
-                    (col + 1) * W / N,  (row + 1) * H / N,
-                ])
+        # Multi-scale sliding windows: scales × strides give proposals that can
+        # achieve IoU ≥ 0.5 with GT boxes of varied sizes.
+        for scale in [0.25, 0.4, 0.6, 0.8, 1.0]:
+            bw, bh = W * scale, H * scale
+            stride_x = max(bw * 0.5, 1)
+            stride_y = max(bh * 0.5, 1)
+            x = 0.0
+            while x + bw <= W + stride_x:
+                y = 0.0
+                while y + bh <= H + stride_y:
+                    x1 = max(0.0, x);       y1 = max(0.0, y)
+                    x2 = min(W, x + bw);    y2 = min(H, y + bh)
+                    proposals.append([x1, y1, x2, y2])
+                    if len(proposals) >= max_proposals:
+                        break
+                    y += stride_y
+                if len(proposals) >= max_proposals:
+                    break
+                x += stride_x
+            if len(proposals) >= max_proposals:
+                break
 
     result = torch.tensor(proposals, dtype=torch.float32)
     torch.save(result, cache_path)
@@ -199,8 +208,8 @@ class Flickr30kGroundingDataset(Dataset):
         self.transform = transforms.Compose([
             transforms.Resize((config.data.image_size, config.data.image_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
+            transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                 std=[0.26862954, 0.26130258, 0.27577711]),
         ])
 
         # --- Load HuggingFace dataset and filter to requested split ---

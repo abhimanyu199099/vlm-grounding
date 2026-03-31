@@ -41,7 +41,7 @@ ROOT     = Path(__file__).parent
 HF_DATASET_NAME = "nlphuji/flickr30k"
 
 # Flickr30k Entities XML annotations (manual download — see docstring above)
-ENTITIES_ANNO_DIR = ROOT / "data" / "flickr30k_entities" / "Annotations" / "Annotations"
+ENTITIES_ANNO_DIR = ROOT / "flickr30k_entities" / "annotations" / "Annotations"
 
 # Cache: pre-computed proposals and region embeddings (large, gitignored)
 CACHE_DIR = ROOT / "cache"
@@ -68,6 +68,18 @@ class ModelConfig:
     lora_alpha:      float = 16.0
     dropout:         float = 0.1
 
+    # Token-weighting MLP
+    token_weighter_hidden_dim: int = 64   # hidden size of the per-token scalar MLP
+
+    # Hard-negative contrastive loss
+    hard_neg_k:              int   = 4     # top-k wrong regions to use as hard negatives
+    hard_neg_penalty:        float = 1.5  # logit scale for hard negatives (>1 = harder)
+    contrastive_temperature: float = 0.07 # InfoNCE temperature
+    contrastive_loss_weight: float = 0.5  # weight of contrastive loss in total loss
+
+    # Token-focused entropy loss
+    entropy_loss_weight:     float = 0.1  # weight of entropy regularisation in total loss
+
 
 # ---------------------------------------------------------------------------
 # Data
@@ -75,13 +87,13 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    max_proposals:      int   = 100    # max region proposals per image
+    max_proposals:      int   = 20     # max region proposals per image
     proposal_method:    Literal["selective_search", "grid"] = "selective_search"
     neg_strategy:       Literal["inbatch", "clip_mined", "cross_image", "all"] = "inbatch"
     clip_mine_topk:     int   = 5      # how many hard negatives to mine per phrase via CLIP
     cross_image_pool:   int   = 50     # images to sample cross-image negatives from
     image_size:         int   = 224
-    num_workers:        int   = 4
+    num_workers:        int   = 0
     pin_memory:         bool  = True
 
 
@@ -91,7 +103,7 @@ class DataConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size:     int   = 32
+    batch_size:     int   = 8
     epochs:         int   = 20
     lr:             float = 1e-4
     weight_decay:   float = 1e-2

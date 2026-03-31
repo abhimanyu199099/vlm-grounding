@@ -129,7 +129,7 @@ class NegativeMiner:
         # Mask padding proposals across the whole bank
         if "proposal_mask" in batch and batch["proposal_mask"] is not None:
             # proposal_mask: (B, N) Bool — True = real proposal
-            flat_mask = batch["proposal_mask"].view(B * N)        # (B*N,)
+            flat_mask = batch["proposal_mask"].to(device).view(B * N)  # (B*N,)
             valid &= flat_mask.unsqueeze(0)                        # (B, B*N)
 
         # Set invalid positions to -inf before top-K

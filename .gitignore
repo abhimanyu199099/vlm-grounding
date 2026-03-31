@@ -5,17 +5,21 @@ data/flickr30k/
 data/flickr30k-images/
 data/Annotations/
 data/splits/
-# Entities XMLs are small enough to commit if desired,
-# but exclude them by default since they're freely re-cloneable
-data/flickr30k_entities/
 *.jpg
 *.jpeg
 *.png
 *.gif
 *.bmp
 
-# HuggingFace datasets cache (downloaded automatically by datasets lib)
-~/.cache/huggingface/
+# -----------------------------------------
+# flickr30k_entities — re-cloneable from GitHub
+# -----------------------------------------
+flickr30k_entities/annotations/
+flickr30k_entities/annotations.zip
+
+# -----------------------------------------
+# HuggingFace datasets cache
+# -----------------------------------------
 .cache/
 cache/
 *.pt.cache
@@ -28,9 +32,6 @@ checkpoints/
 *.pth
 *.bin
 *.safetensors
-
-# huggingface model downloads
-~/.cache/huggingface/
 
 # -----------------------------------------
 # training runs and logs
@@ -52,14 +53,6 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-eggs/
-parts/
-var/
-sdist/
-develop-eggs/
-.installed.cfg
-lib/
-lib64/
 
 # virtual environments
 .venv/

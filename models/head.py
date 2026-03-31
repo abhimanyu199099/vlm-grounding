@@ -16,18 +16,19 @@ Architecture:
     1. text_proj:    (B, L, D_text) → (B, L, D)   learned linear
        region_proj:  (B, N, D_proj) → (B, N, D)   learned linear
     2. head_depth × TextOverRegionAttention layers:
-         Q = text tokens, K = V = region features (with LoRA on Q and V)
-    3. Mean-pool text over real tokens → (B, D)
+         Q = text tokens, K = V = region features
+    3. TokenWeightingMLP: (B, L, D_text) → (B, L) scalar weights, masked softmax
+       Weighted sum of text_proj output replaces mean-pool → query (B, D)
     4. scorer linear → query (B, D)
     5. Dot product with region_proj output → scores (B, N)
 
-  Loss:
-    grounding_loss() supports three modes depending on what NegativeMiner returns:
-      a) neg_indices=None          → plain cross-entropy over all proposals
-      b) neg_indices, cross_image=False → select (pos + per-image negs), BCE
-      c) neg_indices, cross_image=True  → select (pos + cross-batch negs), BCE
-         In this case neg_indices are flat indices into (B*N,) and the loss
-         builds a cross-batch logit matrix before selecting.
+  Returns: (scores, token_weights, query)
+    scores        : (B, N)  — un-normalised logits per proposal
+    token_weights : (B, L)  — per-token importance weights (sum=1 over real tokens)
+    query         : (B, D)  — weighted phrase embedding (used by contrastive loss)
+
+  Loss functions live in models/losses.py (grounding_loss, hard_negative_contrastive_loss,
+  token_entropy_loss). grounding_loss is re-exported here for backwards compatibility.
 """
 
 import math
@@ -38,45 +39,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import Config
-
-
-# ---------------------------------------------------------------------------
-# LoRA building block
-# ---------------------------------------------------------------------------
-
-class LoRALinear(nn.Module):
-    """
-    nn.Linear with an optional low-rank adapter (LoRA).
-
-    The base linear weight is frozen. Only lora_A and lora_B are trained.
-    When rank=0 the module is a plain frozen linear with no adapter.
-
-    Output: W·x + (B·A·x) * (alpha/rank)
-    lora_B is zero-initialised so the adapter starts as a no-op.
-    """
-
-    def __init__(self, in_features: int, out_features: int,
-                 rank: int = 8, alpha: float = 16.0, bias: bool = False):
-        super().__init__()
-        self.rank  = rank
-        self.scale = alpha / rank if rank > 0 else 0.0
-
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
-        self.linear.weight.requires_grad = False
-        if bias and self.linear.bias is not None:
-            self.linear.bias.requires_grad = False
-
-        if rank > 0:
-            self.lora_A = nn.Linear(in_features, rank, bias=False)
-            self.lora_B = nn.Linear(rank, out_features, bias=False)
-            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-            nn.init.zeros_(self.lora_B.weight)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.linear(x)
-        if self.rank > 0:
-            out = out + self.scale * self.lora_B(self.lora_A(x))
-        return out
+from .losses import grounding_loss  # re-exported; full loss suite is in losses.py
 
 
 # ---------------------------------------------------------------------------
@@ -87,9 +50,6 @@ class TextOverRegionAttention(nn.Module):
     """
     Multi-head cross-attention: Q from text tokens, K/V from region features.
 
-    LoRA is applied to Q and V projections (text side and value routing).
-    K is kept fully frozen — region features are the stable reference.
-
     Pre-norm on both text (Q) and regions (K) before projection.
     Residual connection on the output.
 
@@ -98,9 +58,7 @@ class TextOverRegionAttention(nn.Module):
     the weighted sum.
     """
 
-    def __init__(self, dim: int, num_heads: int,
-                 lora_rank: int = 8, lora_alpha: float = 16.0,
-                 dropout: float = 0.1):
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.1):
         super().__init__()
         assert dim % num_heads == 0, \
             f"embed_dim {dim} must be divisible by num_heads {num_heads}"
@@ -108,9 +66,9 @@ class TextOverRegionAttention(nn.Module):
         self.head_dim  = dim // num_heads
         self.scale     = self.head_dim ** -0.5
 
-        self.q_proj   = LoRALinear(dim, dim, rank=lora_rank, alpha=lora_alpha)
-        self.k_proj   = LoRALinear(dim, dim, rank=0)          # frozen
-        self.v_proj   = LoRALinear(dim, dim, rank=lora_rank, alpha=lora_alpha)
+        self.q_proj   = nn.Linear(dim, dim, bias=False)
+        self.k_proj   = nn.Linear(dim, dim, bias=False)
+        self.v_proj   = nn.Linear(dim, dim, bias=False)
         self.out_proj = nn.Linear(dim, dim)
 
         self.norm_q  = nn.LayerNorm(dim)
@@ -158,6 +116,45 @@ class TextOverRegionAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Token-weighting MLP
+# ---------------------------------------------------------------------------
+
+class TokenWeightingMLP(nn.Module):
+    """
+    Predicts a scalar importance weight for each text token.
+
+    Architecture: Linear(D_text, hidden) → ReLU → Linear(hidden, 1) → squeeze
+    The raw scalar logits are masked (padding → -inf) and then softmax-normalised
+    so weights sum to 1.0 over real tokens per sequence.
+
+    These weights replace mean-pooling in GroundingHead: the query vector is
+    a learned weighted sum of per-token projected features rather than a simple
+    average. This lets the model upweight semantically important words
+    (e.g. "blue", "shirt") and downweight function words ("a", "the").
+
+    Trainable — parameters are discovered by model.parameters() and updated
+    by the AdamW optimizer alongside the rest of the head.
+    """
+
+    def __init__(self, d_text: int, hidden_dim: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_text, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),   # → (B, L, 1)
+        )
+
+    def forward(
+        self,
+        text_hidden: torch.Tensor,   # (B, L, D_text)
+        token_mask:  torch.Tensor,   # (B, L) bool, True = real token
+    ) -> torch.Tensor:               # (B, L) softmax weights
+        logits = self.net(text_hidden).squeeze(-1)            # (B, L)
+        logits = logits.masked_fill(~token_mask, float("-inf"))
+        return torch.softmax(logits, dim=-1)                  # (B, L)
+
+
+# ---------------------------------------------------------------------------
 # Full grounding head
 # ---------------------------------------------------------------------------
 
@@ -168,12 +165,8 @@ class GroundingHead(nn.Module):
     Trainable parameters:
         text_proj   — maps text_hidden_dim → D
         region_proj — maps projection_dim  → D  (learned re-scaling)
-        LoRA A/B matrices in each attention layer's Q and V projections
-        out_proj, norm, scorer in each layer / the head itself
-
-    Frozen parameters:
-        K projection weights in each TextOverRegionAttention layer
-        (K inherits LoRALinear with rank=0 → base linear is frozen, no adapter)
+        Q, K, V, out_proj in each TextOverRegionAttention layer
+        norm, scorer in each layer / the head itself
     """
 
     def __init__(self, config: Config,
@@ -192,15 +185,17 @@ class GroundingHead(nn.Module):
         cfg = config.model
         D   = cfg.embed_dim
 
-        self.text_proj   = nn.Linear(text_hidden_dim, D)
-        self.region_proj = nn.Linear(region_proj_dim, D)
+        self.text_proj      = nn.Linear(text_hidden_dim, D)
+        self.region_proj    = nn.Linear(region_proj_dim, D)
+        self.token_weighter = TokenWeightingMLP(
+            d_text=text_hidden_dim,
+            hidden_dim=cfg.token_weighter_hidden_dim,
+        )
 
         self.layers = nn.ModuleList([
             TextOverRegionAttention(
                 dim=D,
                 num_heads=cfg.num_heads,
-                lora_rank=cfg.lora_rank,
-                lora_alpha=cfg.lora_alpha,
                 dropout=cfg.dropout,
             )
             for _ in range(cfg.head_depth)
@@ -218,10 +213,12 @@ class GroundingHead(nn.Module):
                 region_embeds: torch.Tensor,                   # (B, N, D_proj)
                 text_mask:     Optional[torch.Tensor] = None,  # (B, L) bool
                 proposal_mask: Optional[torch.Tensor] = None,  # (B, N) bool
-                ) -> torch.Tensor:
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Returns scores: (B, N) — un-normalised logit per proposal per phrase.
-        Padding proposals are set to -inf.
+        Returns:
+            scores        : (B, N)  un-normalised logits (padding → -inf)
+            token_weights : (B, L)  per-token importance weights (sum=1 over real tokens)
+            query         : (B, D)  weighted phrase embedding before scorer projection
         """
         text    = self.text_proj(text_hidden)        # (B, L, D)
         regions = self.region_proj(region_embeds)    # (B, N, D)
@@ -231,136 +228,35 @@ class GroundingHead(nn.Module):
 
         text = self.norm(text)
 
-        # Mean-pool text over real (non-padding) tokens
+        # Token-weighted pooling — replaces mean-pool
+        # token_weighter operates on the *raw* text_hidden (pre text_proj) so
+        # the weighting MLP sees the original CLIP token features and is not
+        # influenced by the cross-attention layers (cleaner gradient signal).
         if text_mask is not None:
-            mask   = text_mask.unsqueeze(-1).float()         # (B, L, 1)
-            pooled = (text * mask).sum(1) / mask.sum(1).clamp(min=1e-6)
+            token_weights = self.token_weighter(text_hidden, text_mask)  # (B, L)
         else:
-            pooled = text.mean(1)                             # (B, D)
+            # No mask: treat all positions as real tokens
+            all_real = torch.ones(
+                text_hidden.shape[:2], dtype=torch.bool, device=text_hidden.device
+            )
+            token_weights = self.token_weighter(text_hidden, all_real)  # (B, L)
 
-        query  = self.scorer(pooled)                          # (B, D)
-        temp   = self.log_temp.exp().clamp(max=100.0)        # scalar, clamped for stability
-        scores = torch.einsum("bd,bnd->bn", query, regions) * temp  # (B, N)
+        # Weighted sum over the cross-attended text features
+        pooled = (token_weights.unsqueeze(-1) * text).sum(dim=1)        # (B, D)
+
+        query  = self.scorer(pooled)                                     # (B, D)
+        temp   = self.log_temp.exp().clamp(max=100.0)
+        scores = torch.einsum("bd,bnd->bn", query, regions) * temp      # (B, N)
 
         if proposal_mask is not None:
             scores = scores.masked_fill(~proposal_mask, float("-inf"))
 
-        return scores
+        return scores, token_weights, query
 
     def trainable_parameters(self):
         """Return only the parameters that require gradients (for the optimizer)."""
         return [p for p in self.parameters() if p.requires_grad]
 
 
-# ---------------------------------------------------------------------------
-# Loss function
-# ---------------------------------------------------------------------------
-
-def grounding_loss(scores:       torch.Tensor,           # (B, N)
-                   pos_idx:      torch.Tensor,           # (B,)
-                   neg_indices:  Optional[torch.Tensor] = None,  # (B, K)
-                   cross_image:  bool = False,
-                   ) -> torch.Tensor:
-    """
-    Grounding loss supporting three modes:
-
-    Mode A — neg_indices is None:
-        Plain cross-entropy treating all N proposals as the softmax class space.
-        Fast and correct; the grounding head learns to rank pos above all others.
-
-    Mode B — neg_indices provided, cross_image=False:
-        Per-image hard negatives. Indices are into proposals[i] (per-image, shape N).
-        We build a restricted logit vector [pos_score | neg_scores] for each item
-        and apply cross-entropy with label 0 (the positive is always first).
-
-    Mode C — neg_indices provided, cross_image=True:
-        Cross-batch hard negatives. Indices are flat into proposals.view(B*N, 4).
-        scores is (B, N); we build a flat region score matrix (B, B*N) by treating
-        all other images' proposals as the candidate pool, select the relevant
-        columns, and apply cross-entropy with label 0.
-
-    Args:
-        scores      : (B, N) raw logits from GroundingHead (padding already -inf)
-        pos_idx     : (B,) ground-truth proposal index per item
-        neg_indices : (B, K) hard negative indices, or None
-        cross_image : whether neg_indices are flat (B*N) indices (True) or per-image (False)
-
-    Returns:
-        scalar loss (mean over batch)
-    """
-    B, N = scores.shape
-    device = scores.device
-
-    # ------------------------------------------------------------------
-    # Mode A — no explicit negatives, standard cross-entropy
-    # ------------------------------------------------------------------
-    if neg_indices is None:
-        return F.cross_entropy(scores, pos_idx)
-
-    # ------------------------------------------------------------------
-    # Mode B — per-image hard negatives
-    # ------------------------------------------------------------------
-    if not cross_image:
-        # Build restricted logit vector: [pos_score, neg_score_1, ..., neg_score_K]
-        # Label is always 0 (positive is at position 0)
-        batch_idx  = torch.arange(B, device=device)
-        pos_scores = scores[batch_idx, pos_idx].unsqueeze(1)          # (B, 1)
-
-        # neg_indices: (B, K) — per-image indices
-        # Clamp to valid range in case of any edge-case overlap with padding
-        neg_indices = neg_indices.clamp(0, N - 1)
-        neg_scores  = scores[
-            batch_idx.unsqueeze(1).expand_as(neg_indices),
-            neg_indices,
-        ]                                                               # (B, K)
-
-        logits = torch.cat([pos_scores, neg_scores], dim=1)            # (B, 1+K)
-        labels = torch.zeros(B, dtype=torch.long, device=device)       # pos at index 0
-        return F.cross_entropy(logits, labels)
-
-    # ------------------------------------------------------------------
-    # Mode C — cross-batch hard negatives (flat B*N index space)
-    # ------------------------------------------------------------------
-    # Build a full (B, B*N) logit matrix: phrase i scored against every proposal
-    # in the entire batch, then select columns for [pos, hard_negs].
-    #
-    # scores is (B, N); flatten to (B*N,) per phrase using the encoder's region
-    # embeddings — but we only have the head's output scores here, not raw embeds.
-    # Instead, we re-index: pos flat index for item i = i*N + pos_idx[i].
-    # neg flat indices are already in (B*N) space from the miner.
-
-    # Flat positive index per item: i*N + pos_idx[i]
-    row_offsets = torch.arange(B, device=device) * N                  # (B,)
-    pos_flat    = row_offsets + pos_idx                                # (B,)
-
-    # Build flat score view: repeat each item's scores for all B*N slots
-    # We can't do this from (B, N) scores directly for cross-batch items —
-    # scores[i] only covers item i's own proposals.
-    #
-    # Workaround: treat cross-batch negatives as coming from the same-image
-    # score space by mapping flat index j → (j // N, j % N) and gathering.
-    neg_img_idx  = neg_indices // N    # (B, K) — which image in the batch
-    neg_prop_idx = neg_indices % N     # (B, K) — which proposal within that image
-
-    # scores is (B, N); gather cross-image scores by indexing correctly
-    # scores[neg_img_idx[i, k], neg_prop_idx[i, k]] = score of phrase neg_img_idx[i,k]
-    # But we want: how does phrase i score the region from image neg_img_idx[i,k]?
-    # We don't have that directly since scores[i] is phrase i vs its own proposals.
-    #
-    # Practical resolution: fall back to per-image mode for cross-batch negatives
-    # by using only those neg_indices that fall within item i's own proposals.
-    # This is semantically equivalent to mode B — the cross-image structure was
-    # already baked in by the miner when it selected which proposals to include.
-    # The flat indices are converted back to per-image indices here.
-    neg_local = neg_prop_idx                                           # (B, K)
-
-    batch_idx  = torch.arange(B, device=device)
-    pos_scores = scores[batch_idx, pos_idx].unsqueeze(1)              # (B, 1)
-    neg_scores = scores[
-        batch_idx.unsqueeze(1).expand_as(neg_local),
-        neg_local.clamp(0, N - 1),
-    ]                                                                  # (B, K)
-
-    logits = torch.cat([pos_scores, neg_scores], dim=1)               # (B, 1+K)
-    labels = torch.zeros(B, dtype=torch.long, device=device)
-    return F.cross_entropy(logits, labels)
+# grounding_loss is imported from losses.py at the top of this file and
+# re-exported so that any existing code importing it from head.py continues to work.
