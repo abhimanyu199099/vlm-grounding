@@ -11,7 +11,7 @@ Given an image and a natural-language phrase, the model predicts which region of
 **1. Clone and install dependencies**
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/abhimanyu199099/vlm-grounding.git
 cd vlm_grounding
 pip install -r requirements.txt
 ```
