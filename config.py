@@ -104,14 +104,14 @@ class DataConfig:
 @dataclass
 class TrainConfig:
     batch_size:     int   = 8
-    epochs:         int   = 20
+    epochs:         int   = 5
     lr:             float = 1e-4
     weight_decay:   float = 1e-2
     warmup_steps:   int   = 500
     grad_clip:      float = 1.0
     log_every:      int   = 50         # steps
     eval_every:     int   = 1          # epochs
-    save_every:     int   = 5          # epochs
+    save_every:     int   = 1          # epochs
     device:         str   = "cuda"     # "cpu" for debugging
     mixed_precision: bool = True
     seed:           int   = 42
