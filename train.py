@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from transformers import CLIPTokenizer
 
 from config import Config, DEFAULT_CONFIG, CKPT_DIR, RUNS_DIR
