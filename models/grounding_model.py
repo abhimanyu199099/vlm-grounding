@@ -90,9 +90,8 @@ class GroundingModel(nn.Module):
         """
         device = next(self.head.parameters()).device
 
-        phrase_tokens  = batch["phrase_tokens"].to(device)        # (B, 77)
-        proposal_crops = batch["proposal_crops"].to(device)       # (B, N, 3, H, W)
-        pos_idx        = batch["pos_idx"].to(device)              # (B,)
+        phrase_tokens = batch["phrase_tokens"].to(device)         # (B, 77)
+        pos_idx       = batch["pos_idx"].to(device)               # (B,)
 
         proposal_mask = batch.get("proposal_mask")
         if proposal_mask is not None:
@@ -101,13 +100,16 @@ class GroundingModel(nn.Module):
         # Attention mask: 1 for real tokens, 0 for padding (CLIP pads with 0)
         attn_mask = (phrase_tokens != 0).to(device)               # (B, 77)
 
-        # ---- Encode (all under no_grad — encoder is frozen) ----
-        text_hidden   = self.encoder.encode_text(phrase_tokens, attn_mask)   # (B, L, D_text)
-        region_embeds = self.encoder.encode_region(proposal_crops)           # (B, N, D_proj)
-
-        # Pooled phrase embeddings for the negative miner (returned in output dict
-        # so train.py can pass them to miner.mine() without a second encoder call)
-        phrase_embeds = self.encoder.encode_phrase(phrase_tokens, attn_mask) # (B, D_proj)
+        # ---- Encode — skip if pre-computed embeddings are in the batch ----
+        if "text_hidden" in batch and "region_embeds" in batch:
+            text_hidden   = batch["text_hidden"].to(device)       # (B, L, D_text)
+            region_embeds = batch["region_embeds"].to(device)     # (B, N, D_proj)
+            phrase_embeds = batch["phrase_embed"].to(device)      # (B, D_proj)
+        else:
+            proposal_crops = batch["proposal_crops"].to(device)   # (B, N, 3, H, W)
+            text_hidden    = self.encoder.encode_text(phrase_tokens, attn_mask)
+            region_embeds  = self.encoder.encode_region(proposal_crops)
+            phrase_embeds  = self.encoder.encode_phrase(phrase_tokens, attn_mask)
 
         # ---- Score ----
         # head now returns (scores, token_weights, query)

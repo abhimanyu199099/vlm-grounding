@@ -87,7 +87,7 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    max_proposals:      int   = 20     # max region proposals per image
+    max_proposals:      int   = 40     # max region proposals per image
     proposal_method:    Literal["selective_search", "grid"] = "selective_search"
     neg_strategy:       Literal["inbatch", "clip_mined", "cross_image", "all"] = "inbatch"
     clip_mine_topk:     int   = 5      # how many hard negatives to mine per phrase via CLIP
@@ -103,7 +103,7 @@ class DataConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size:     int   = 8
+    batch_size:     int   = 16
     epochs:         int   = 5
     lr:             float = 1e-4
     weight_decay:   float = 1e-2

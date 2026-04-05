@@ -267,18 +267,57 @@ class Flickr30kGroundingDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         img_id, phrase_dict = self.samples[idx]
-        hf_row = self._hf_rows[img_id]
+        hf_row  = self._hf_rows[img_id]
+        method  = self.cfg.data.proposal_method
+        gt_box  = torch.tensor(phrase_dict["boxes"][0], dtype=torch.float32)
 
-        image  = hf_row["image"].convert("RGB")   # PIL Image from HF
-        gt_box = torch.tensor(phrase_dict["boxes"][0], dtype=torch.float32)
+        # ---- Try to load pre-computed CLIP embeddings ----
+        region_cache_path = CACHE_DIR / f"{img_id}_{method}_clip_regions.pt"
+        phrase_cache_path = CACHE_DIR / f"{img_id}_clip_phrases.pt"
+        use_cache = region_cache_path.exists() and phrase_cache_path.exists()
 
-        proposals = get_proposals(
-            image,
-            image_id=img_id,
-            method=self.cfg.data.proposal_method,
-            max_proposals=self.cfg.data.max_proposals,
-        )   # (N, 4)
+        if use_cache:
+            phrase_cache = torch.load(phrase_cache_path, weights_only=True)
+            pid = phrase_dict["phrase_id"]
 
+            if pid in phrase_cache:
+                region_embeds = torch.load(region_cache_path, weights_only=True).float()  # (N, D)
+                text_hidden   = phrase_cache[pid]["text_hidden"].float()    # (77, D_text)
+                phrase_embed  = phrase_cache[pid]["phrase_embed"].float()   # (D_proj)
+
+                # Still need proposals for IoU / box decoding; load from proposal cache
+                image     = hf_row["image"].convert("RGB")
+                proposals = get_proposals(image, img_id, method,
+                                          self.cfg.data.max_proposals)
+                pos_idx   = _find_best_proposal(proposals, gt_box)
+
+                # phrase_tokens still needed for attn_mask in grounding_model
+                phrase_tokens = self.tokenizer(
+                    phrase_dict["phrase"],
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=77,
+                ).input_ids.squeeze(0)
+
+                return {
+                    "image_id":      img_id,
+                    "phrase":        phrase_dict["phrase"],
+                    "phrase_tokens": phrase_tokens,
+                    "proposals":     proposals,
+                    "pos_idx":       pos_idx,
+                    "gt_box":        gt_box,
+                    "entity_type":   phrase_dict["entity_type"],
+                    # pre-computed embeddings — no proposal_crops
+                    "text_hidden":   text_hidden,
+                    "region_embeds": region_embeds,
+                    "phrase_embed":  phrase_embed,
+                }
+
+        # ---- Fallback: compute on the fly ----
+        image  = hf_row["image"].convert("RGB")
+        proposals = get_proposals(image, img_id, method,
+                                  self.cfg.data.max_proposals)
         pos_idx        = _find_best_proposal(proposals, gt_box)
         proposal_crops = _crop_proposals(image, proposals, self.transform)
 
@@ -288,7 +327,7 @@ class Flickr30kGroundingDataset(Dataset):
             padding="max_length",
             truncation=True,
             max_length=77,
-        ).input_ids.squeeze(0)   # (77,)
+        ).input_ids.squeeze(0)
 
         return {
             "image_id":       img_id,
@@ -340,27 +379,50 @@ def collate_fn(batch: List[dict]) -> dict:
     """
     Pad variable-length proposal lists to the per-batch maximum N.
     Adds proposal_mask: (B, N_max) BoolTensor — True = valid, False = padding.
-    """
-    max_n = max(item["proposals"].shape[0] for item in batch)
 
-    padded_proposals, padded_crops, masks = [], [], []
+    Handles two modes transparently:
+      Cached   : items have "text_hidden", "region_embeds", "phrase_embed" —
+                 no "proposal_crops". Embeddings are padded along the N dim.
+      Uncached : items have "proposal_crops" — full crops for the encoder.
+    """
+    max_n     = max(item["proposals"].shape[0] for item in batch)
+    use_cache = "text_hidden" in batch[0]
+
+    padded_proposals = []
+    masks            = []
+    padded_crops     = []          # only populated in uncached mode
+    padded_regions   = []          # only populated in cached mode
+
     for item in batch:
         n   = item["proposals"].shape[0]
         pad = max_n - n
-        padded_proposals.append(F.pad(item["proposals"],      (0, 0, 0, pad)))
-        padded_crops.append(    F.pad(item["proposal_crops"], (0, 0, 0, 0, 0, 0, 0, pad)))
+        padded_proposals.append(F.pad(item["proposals"], (0, 0, 0, pad)))
         m = torch.zeros(max_n, dtype=torch.bool)
         m[:n] = True
         masks.append(m)
 
-    return {
-        "image_id":       [item["image_id"]   for item in batch],
-        "phrase":         [item["phrase"]      for item in batch],
-        "entity_type":    [item["entity_type"] for item in batch],
-        "phrase_tokens":  torch.stack([item["phrase_tokens"]  for item in batch]),
-        "proposals":      torch.stack(padded_proposals),
-        "proposal_crops": torch.stack(padded_crops),
-        "proposal_mask":  torch.stack(masks),
-        "pos_idx":        torch.tensor([item["pos_idx"] for item in batch], dtype=torch.long),
-        "gt_box":         torch.stack([item["gt_box"]   for item in batch]),
+        if use_cache:
+            # region_embeds: (N, D) → pad to (max_n, D)
+            padded_regions.append(F.pad(item["region_embeds"], (0, 0, 0, pad)))
+        else:
+            padded_crops.append(F.pad(item["proposal_crops"], (0, 0, 0, 0, 0, 0, 0, pad)))
+
+    out = {
+        "image_id":      [item["image_id"]    for item in batch],
+        "phrase":        [item["phrase"]       for item in batch],
+        "entity_type":   [item["entity_type"]  for item in batch],
+        "phrase_tokens": torch.stack([item["phrase_tokens"] for item in batch]),
+        "proposals":     torch.stack(padded_proposals),
+        "proposal_mask": torch.stack(masks),
+        "pos_idx":       torch.tensor([item["pos_idx"] for item in batch], dtype=torch.long),
+        "gt_box":        torch.stack([item["gt_box"]   for item in batch]),
     }
+
+    if use_cache:
+        out["text_hidden"]   = torch.stack([item["text_hidden"]   for item in batch])
+        out["region_embeds"] = torch.stack(padded_regions)
+        out["phrase_embed"]  = torch.stack([item["phrase_embed"]  for item in batch])
+    else:
+        out["proposal_crops"] = torch.stack(padded_crops)
+
+    return out
