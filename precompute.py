@@ -164,10 +164,12 @@ def precompute_phrase_embeds(encoder: FrozenCLIPEncoder,
 
         text_hidden   = encoder.encode_text(input_ids, attn_mask).cpu().half()    # (B, 77, D_text)
         phrase_embeds = encoder.encode_phrase(input_ids, attn_mask).cpu().half()  # (B, D_proj)
+        seq_lens      = attn_mask.sum(dim=1).cpu()                                # (B,) real token counts
 
         for i, (img_id, phrase_id, _) in enumerate(batch_items):
+            L = int(seq_lens[i])
             results[(img_id, phrase_id)] = {
-                "text_hidden":  text_hidden[i],
+                "text_hidden":  text_hidden[i, :L],   # (L, D_text) — padding stripped
                 "phrase_embed": phrase_embeds[i],
             }
 
