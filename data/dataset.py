@@ -37,6 +37,7 @@ Tensor contract (what models/ and train.py expect per batch key):
   phrase          : list[str]   length B
 """
 
+import random
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -136,7 +137,7 @@ def get_proposals(image: Image.Image,
     """
     cache_path = CACHE_DIR / f"{image_id}_{method}.pt"
     if cache_path.exists():
-        return torch.load(cache_path)
+        return torch.load(cache_path, weights_only=True)
 
     W, H = image.size
     proposals = []
@@ -230,13 +231,16 @@ class Flickr30kGroundingDataset(Dataset):
         )
         hf = hf_full.filter(lambda r: r["split"] == split)
 
-        # Keep rows in memory indexed by flickr_id for O(1) lookup.
+        # Store the dataset object and a flickr_id → row-index map for O(1)
+        # lazy access. Keeping full rows (with image bytes) in a dict would
+        # exhaust CPU RAM when 4+ DDP workers each hold a copy.
         # img_id in the parquet revision is a sequential integer ('0','1',...),
         # NOT the original Flickr image ID. The XML files are named after the
         # Flickr ID (e.g. 1000092795.xml), which is the filename stem.
         # We use filename (e.g. "1000092795.jpg") → strip ".jpg" → flickr_id.
-        self._hf_rows: Dict[str, dict] = {
-            r["filename"].replace(".jpg", ""): r for r in hf
+        self._hf_ds = hf
+        self._hf_rows: Dict[str, int] = {
+            r["filename"].replace(".jpg", ""): i for i, r in enumerate(hf)
         }
 
         # --- Join with Entities annotations and flatten to samples ---
@@ -258,23 +262,28 @@ class Flickr30kGroundingDataset(Dataset):
 
         if debug:
             self.samples = self.samples[:200]
+        elif config.data.data_fraction < 1.0:
+            k = int(len(self.samples) * config.data.data_fraction)
+            self.samples = random.sample(self.samples, k)
 
         print(f"[dataset] {split}: {len(self.samples)} samples "
-              f"({len(self._hf_rows)} images)")
+              f"({len(self._hf_rows)} images) | use_cache={self.cfg.data.use_cache}")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict:
         img_id, phrase_dict = self.samples[idx]
-        hf_row  = self._hf_rows[img_id]
+        hf_row  = self._hf_ds[self._hf_rows[img_id]]
         method  = self.cfg.data.proposal_method
         gt_box  = torch.tensor(phrase_dict["boxes"][0], dtype=torch.float32)
 
         # ---- Try to load pre-computed CLIP embeddings ----
         region_cache_path = CACHE_DIR / f"{img_id}_{method}_clip_regions.pt"
         phrase_cache_path = CACHE_DIR / f"{img_id}_clip_phrases.pt"
-        use_cache = region_cache_path.exists() and phrase_cache_path.exists()
+        use_cache = (self.cfg.data.use_cache
+                     and region_cache_path.exists()
+                     and phrase_cache_path.exists())
 
         if use_cache:
             phrase_cache = torch.load(phrase_cache_path, weights_only=True)

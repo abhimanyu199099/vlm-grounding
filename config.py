@@ -41,7 +41,7 @@ ROOT     = Path(__file__).parent
 HF_DATASET_NAME = "nlphuji/flickr30k"
 
 # Flickr30k Entities XML annotations (manual download — see docstring above)
-ENTITIES_ANNO_DIR = ROOT / "flickr30k_entities" / "annotations" / "Annotations"
+ENTITIES_ANNO_DIR = ROOT / "flickr30k_entities" / "Annotations"
 
 # Cache: pre-computed proposals and region embeddings (large, gitignored)
 CACHE_DIR = ROOT / "cache"
@@ -87,14 +87,16 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    max_proposals:      int   = 40     # max region proposals per image
-    proposal_method:    Literal["selective_search", "grid"] = "selective_search"
+    max_proposals:      int   = 20     # max region proposals per image
+    proposal_method:    Literal["selective_search", "grid"] = "grid"
     neg_strategy:       Literal["inbatch", "clip_mined", "cross_image", "all"] = "inbatch"
     clip_mine_topk:     int   = 5      # how many hard negatives to mine per phrase via CLIP
     cross_image_pool:   int   = 50     # images to sample cross-image negatives from
     image_size:         int   = 224
     num_workers:        int   = 0
     pin_memory:         bool  = True
+    use_cache:          bool  = True  # load precomputed CLIP embeddings from CACHE_DIR if available
+    data_fraction:      float = 1.0   # random subset of training data (1.0 = full dataset)
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +140,9 @@ class Config:
     data:  DataConfig  = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     eval:  EvalConfig  = field(default_factory=EvalConfig)
-    run_name: str      = "baseline"
-    debug:    bool     = False         # small dataset, fast iterations
+    run_name:      str  = "baseline"
+    debug:         bool = False        # small dataset, fast iterations
+    skip_baseline: bool = False        # skip CLIP baseline eval before training
 
 
 # Convenience: one default config instance

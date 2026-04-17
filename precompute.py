@@ -211,6 +211,7 @@ def main():
 
     for split in args.split:
         print(f"\n=== {split} ===")
+        cfg.data.use_cache = False   # always load raw crops; we are building the cache
         dataset = Flickr30kGroundingDataset(cfg, split=split, tokenizer=tokenizer)
         precompute_region_embeds(encoder, dataset, method, device,
                                  batch_size=args.region_batch_size,

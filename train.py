@@ -11,12 +11,17 @@ Run:
 """
 
 import argparse
+import os
 import random
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
 from torch.amp import GradScaler, autocast
 from transformers import CLIPTokenizer
 
@@ -43,14 +48,17 @@ def set_seed(seed: int):
 # Training step
 # ---------------------------------------------------------------------------
 
-def train_one_epoch(model, loader, optimizer, scaler, miner, evaluator, cfg, epoch):
+def train_one_epoch(model, raw_model, loader, optimizer, scaler, miner, evaluator, cfg, epoch):
     model.train()
     total_loss       = 0.0
     total_g_loss     = 0.0
     total_c_loss     = 0.0
     total_e_loss     = 0.0
 
-    for step, batch in enumerate(loader):
+    is_main = int(os.environ.get("LOCAL_RANK", 0)) == 0
+    pbar = tqdm(loader, desc=f"Epoch {epoch}", disable=not is_main, leave=True)
+
+    for step, batch in enumerate(pbar):
         optimizer.zero_grad()
 
         with autocast('cuda', enabled=cfg.train.mixed_precision):
@@ -74,7 +82,7 @@ def train_one_epoch(model, loader, optimizer, scaler, miner, evaluator, cfg, epo
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(
-            model.trainable_parameters, cfg.train.grad_clip
+            raw_model.trainable_parameters, cfg.train.grad_clip
         )
         scaler.step(optimizer)
         scaler.update()
@@ -85,18 +93,13 @@ def train_one_epoch(model, loader, optimizer, scaler, miner, evaluator, cfg, epo
         total_e_loss += out["entropy_loss"].item()
 
         if step % cfg.train.log_every == 0:
-            n     = step + 1
-            avg   = total_loss   / n
-            avg_g = total_g_loss / n
-            avg_c = total_c_loss / n
-            avg_e = total_e_loss / n
-            print(
-                f"  Epoch {epoch} | step {step}/{len(loader)}"
-                f" | loss {avg:.4f}"
-                f"  (grounding {avg_g:.4f}"
-                f" | contrastive {avg_c:.4f}"
-                f" | entropy {avg_e:.4f})"
-            )
+            n = step + 1
+            pbar.set_postfix({
+                "loss":        f"{total_loss   / n:.4f}",
+                "grounding":   f"{total_g_loss / n:.4f}",
+                "contrastive": f"{total_c_loss / n:.4f}",
+                "entropy":     f"{total_e_loss / n:.4f}",
+            })
 
     return total_loss / len(loader)
 
@@ -142,12 +145,17 @@ def clip_baseline(model, loader, evaluator, cfg):
 
     for batch in loader:
         device = next(model.parameters()).device
-        phrase_tokens  = batch["phrase_tokens"].to(device)
-        proposal_crops = batch["proposal_crops"].to(device)
-        attn_mask      = (phrase_tokens != 0).to(device)
+        phrase_tokens = batch["phrase_tokens"].to(device)
+        attn_mask     = (phrase_tokens != 0).to(device)
 
-        phrase_embeds = model.encoder.encode_phrase(phrase_tokens, attn_mask)  # (B, D)
-        region_embeds = model.encoder.encode_region(proposal_crops)            # (B, N, D)
+        if "region_embeds" in batch:
+            # Pre-computed embeddings available — skip encoder forward pass
+            region_embeds = batch["region_embeds"].to(device)   # (B, N, D)
+            phrase_embeds = batch["phrase_embed"].to(device)     # (B, D)
+        else:
+            proposal_crops = batch["proposal_crops"].to(device)
+            phrase_embeds = model.encoder.encode_phrase(phrase_tokens, attn_mask)  # (B, D)
+            region_embeds = model.encoder.encode_region(proposal_crops)            # (B, N, D)
 
         # Cosine similarity: (B, N)
         scores = torch.einsum("bd,bnd->bn", phrase_embeds, region_embeds)
@@ -173,8 +181,19 @@ def clip_baseline(model, loader, evaluator, cfg):
 # ---------------------------------------------------------------------------
 
 def main(cfg: Config):
-    set_seed(cfg.train.seed)
-    device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
+    # --- DDP setup ---
+    ddp = "LOCAL_RANK" in os.environ
+    if ddp:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        dist.init_process_group(backend="nccl")
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+    else:
+        local_rank = 0
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    is_main = local_rank == 0
+
+    set_seed(cfg.train.seed + local_rank)
 
     tokenizer = CLIPTokenizer.from_pretrained(cfg.model.clip_model)
 
@@ -184,62 +203,86 @@ def main(cfg: Config):
     val_ds   = Flickr30kGroundingDataset(cfg, split="val",
                                          tokenizer=tokenizer, debug=cfg.debug)
 
-    train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size,
-                              shuffle=True,  collate_fn=collate_fn,
-                              num_workers=cfg.data.num_workers,
-                              pin_memory=cfg.data.pin_memory)
-    val_loader   = DataLoader(val_ds,   batch_size=cfg.train.batch_size,
-                              shuffle=False, collate_fn=collate_fn,
-                              num_workers=cfg.data.num_workers)
+    train_sampler = DistributedSampler(train_ds, shuffle=True) if ddp else None
+    persistent    = cfg.data.num_workers > 0
+    train_loader  = DataLoader(train_ds, batch_size=cfg.train.batch_size,
+                               shuffle=(train_sampler is None),
+                               sampler=train_sampler,
+                               collate_fn=collate_fn,
+                               num_workers=cfg.data.num_workers,
+                               pin_memory=cfg.data.pin_memory,
+                               persistent_workers=persistent)
+    val_loader    = DataLoader(val_ds,   batch_size=cfg.train.batch_size,
+                               shuffle=False, collate_fn=collate_fn,
+                               num_workers=cfg.data.num_workers,
+                               persistent_workers=persistent)
 
     # Model
-    model = GroundingModel(cfg).to(device)
-    print(f"Trainable params : {model.trainable_param_count():,}")
-    print(f"Total params     : {model.total_param_count():,}")
+    raw_model = GroundingModel(cfg).to(device)
+
+    if is_main:
+        print(f"Trainable params : {raw_model.trainable_param_count():,}")
+        print(f"Total params     : {raw_model.total_param_count():,}")
+
+    # CLIP baseline — run before DDP wrap so no collective ops are active
+    evaluator = GroundingEvaluator(cfg)
+    if is_main and not cfg.skip_baseline:
+        print("\n--- CLIP baseline (no training) ---")
+        baseline = clip_baseline(raw_model, val_loader, evaluator, cfg)
+        print(f"  Acc@0.5: {baseline['acc@0.5']:.4f}  |  mean IoU: {baseline['mean_iou']:.4f}")
+    if ddp:
+        dist.barrier()  # all ranks wait for rank 0 to finish baseline
+
+    # Wrap in DDP after baseline is done
+    if ddp:
+        model = DDP(raw_model, device_ids=[local_rank])
+    else:
+        model = raw_model
 
     # Optimizer (only trainable params)
     optimizer = torch.optim.AdamW(
-        model.trainable_parameters,
+        raw_model.trainable_parameters,
         lr=cfg.train.lr,
         weight_decay=cfg.train.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.train.epochs
     )
-    scaler    = GradScaler('cuda', enabled=cfg.train.mixed_precision)
-    miner     = NegativeMiner(cfg, clip_model=model.encoder.clip)
-    evaluator = GroundingEvaluator(cfg)
-
-    # CLIP baseline (run once)
-    print("\n--- CLIP baseline (no training) ---")
-    baseline = clip_baseline(model, val_loader, evaluator, cfg)
-    print(f"  Acc@0.5: {baseline['acc@0.5']:.4f}  |  mean IoU: {baseline['mean_iou']:.4f}")
+    scaler = GradScaler('cuda', enabled=cfg.train.mixed_precision)
+    miner  = NegativeMiner(cfg, clip_model=raw_model.encoder.clip)
 
     # Training loop
     best_acc = 0.0
     run_dir  = CKPT_DIR / cfg.run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        run_dir.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, cfg.train.epochs + 1):
-        print(f"\n=== Epoch {epoch}/{cfg.train.epochs} ===")
+    for epoch in tqdm(range(1, cfg.train.epochs + 1), desc="Training", disable=not is_main):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        if is_main:
+            print(f"\n=== Epoch {epoch}/{cfg.train.epochs} ===")
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, scaler, miner, evaluator, cfg, epoch
+            model, raw_model, train_loader, optimizer, scaler, miner, evaluator, cfg, epoch
         )
         scheduler.step()
 
-        if epoch % cfg.train.eval_every == 0:
-            metrics = evaluate(model, val_loader, evaluator, cfg)
+        if epoch % cfg.train.eval_every == 0 and is_main:
+            metrics = evaluate(raw_model, val_loader, evaluator, cfg)
             acc = metrics["acc@0.5"]
             print(f"  Val Acc@0.5: {acc:.4f}  |  mean IoU: {metrics['mean_iou']:.4f}")
             print(f"  Breakdown: {metrics['acc_by_type']}")
 
             if acc > best_acc:
                 best_acc = acc
-                model.save(run_dir / "best.pt", epoch, optimizer, metrics)
+                raw_model.save(run_dir / "best.pt", epoch, optimizer, metrics)
                 print(f"  ** New best: {best_acc:.4f} — saved to {run_dir}/best.pt")
 
-        if epoch % cfg.train.save_every == 0:
-            model.save(run_dir / f"epoch_{epoch:03d}.pt", epoch)
+        if epoch % cfg.train.save_every == 0 and is_main:
+            raw_model.save(run_dir / f"epoch_{epoch:03d}.pt", epoch)
+
+    if ddp:
+        dist.destroy_process_group()
 
     print(f"\nTraining complete. Best Acc@0.5: {best_acc:.4f}")
 
@@ -250,12 +293,24 @@ if __name__ == "__main__":
     parser.add_argument("--debug",    action="store_true")
     parser.add_argument("--lora_rank", type=int, default=None)
     parser.add_argument("--head_depth", type=int, default=None)
+    cache_grp = parser.add_mutually_exclusive_group()
+    cache_grp.add_argument("--use_cache", dest="use_cache", action="store_true",  default=None,
+                           help="load precomputed CLIP embeddings from cache (default: on)")
+    cache_grp.add_argument("--no_cache",  dest="use_cache", action="store_false",
+                           help="disable cache; run full CLIP forward pass every step")
+    parser.add_argument("--data_fraction", type=float, default=None,
+                        help="random fraction of training data to use, e.g. 0.4")
+    parser.add_argument("--skip_baseline", action="store_true",
+                        help="skip CLIP baseline eval before training")
     args = parser.parse_args()
 
     cfg = DEFAULT_CONFIG
     cfg.run_name = args.run_name
     cfg.debug    = args.debug
-    if args.lora_rank  is not None: cfg.model.lora_rank  = args.lora_rank
-    if args.head_depth is not None: cfg.model.head_depth = args.head_depth
+    if args.lora_rank     is not None: cfg.model.lora_rank    = args.lora_rank
+    if args.head_depth    is not None: cfg.model.head_depth   = args.head_depth
+    if args.use_cache     is not None: cfg.data.use_cache     = args.use_cache
+    if args.data_fraction is not None: cfg.data.data_fraction = args.data_fraction
+    if args.skip_baseline: cfg.skip_baseline = args.skip_baseline
 
     main(cfg)
