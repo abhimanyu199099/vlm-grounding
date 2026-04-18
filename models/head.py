@@ -204,6 +204,15 @@ class GroundingHead(nn.Module):
         self.norm   = nn.LayerNorm(D)
         self.scorer = nn.Linear(D, D, bias=False)
 
+        self.box_head = nn.Sequential(
+            nn.Linear(2 * D, D),
+            nn.ReLU(),
+            nn.Linear(D, D // 2),
+            nn.ReLU(),
+            nn.Linear(D // 2, 4),
+            nn.Sigmoid(),
+        )
+
         # Temperature parameter — learned scalar for scoring stability
         # Initialised to log(1/0.07) following CLIP convention
         self.log_temp = nn.Parameter(torch.tensor(math.log(1 / 0.07)))
@@ -213,12 +222,13 @@ class GroundingHead(nn.Module):
                 region_embeds: torch.Tensor,                   # (B, N, D_proj)
                 text_mask:     Optional[torch.Tensor] = None,  # (B, L) bool
                 proposal_mask: Optional[torch.Tensor] = None,  # (B, N) bool
-                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
             scores        : (B, N)  un-normalised logits (padding → -inf)
             token_weights : (B, L)  per-token importance weights (sum=1 over real tokens)
             query         : (B, D)  weighted phrase embedding before scorer projection
+            pred_boxes    : (B, 4)  normalized cxcywh box prediction, values in [0, 1]
         """
         text    = self.text_proj(text_hidden)        # (B, L, D)
         regions = self.region_proj(region_embeds)    # (B, N, D)
@@ -228,30 +238,33 @@ class GroundingHead(nn.Module):
 
         text = self.norm(text)
 
-        # Token-weighted pooling — replaces mean-pool
-        # token_weighter operates on the *raw* text_hidden (pre text_proj) so
-        # the weighting MLP sees the original CLIP token features and is not
-        # influenced by the cross-attention layers (cleaner gradient signal).
+        # Token-weighted pooling on post-cross-attention text
         if text_mask is not None:
-            token_weights = self.token_weighter(text_hidden, text_mask)  # (B, L)
+            token_weights = self.token_weighter(text, text_mask)  # (B, L)
         else:
-            # No mask: treat all positions as real tokens
             all_real = torch.ones(
-                text_hidden.shape[:2], dtype=torch.bool, device=text_hidden.device
+                text.shape[:2], dtype=torch.bool, device=text.device
             )
-            token_weights = self.token_weighter(text_hidden, all_real)  # (B, L)
+            token_weights = self.token_weighter(text, all_real)   # (B, L)
 
         # Weighted sum over the cross-attended text features
-        pooled = (token_weights.unsqueeze(-1) * text).sum(dim=1)        # (B, D)
+        pooled = (token_weights.unsqueeze(-1) * text).sum(dim=1)  # (B, D)
 
-        query  = self.scorer(pooled)                                     # (B, D)
+        query  = self.scorer(pooled)                               # (B, D)
         temp   = self.log_temp.exp().clamp(max=100.0)
-        scores = torch.einsum("bd,bnd->bn", query, regions) * temp      # (B, N)
+        scores = torch.einsum("bd,bnd->bn", query, regions) * temp  # (B, N)
 
         if proposal_mask is not None:
             scores = scores.masked_fill(~proposal_mask, float("-inf"))
 
-        return scores, token_weights, query
+        # Direct box prediction from attended phrase + score-weighted region
+        # nan_to_num guards the degenerate case where all proposals are masked (-inf→NaN)
+        score_weights  = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)  # (B, N)
+        attended_region = torch.einsum('bn,bnd->bd', score_weights, regions)   # (B, D)
+        box_input  = torch.cat([query, attended_region], dim=-1)               # (B, 2D)
+        pred_boxes = self.box_head(box_input)                                  # (B, 4) in [0,1]
+
+        return scores, token_weights, query, pred_boxes
 
     def trainable_parameters(self):
         """Return only the parameters that require gradients (for the optimizer)."""

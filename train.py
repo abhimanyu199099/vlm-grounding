@@ -10,6 +10,7 @@ Run:
     python train.py --debug   # fast smoke-test with 200 samples
 """
 import argparse
+import contextlib
 import datetime
 import os
 import random
@@ -55,51 +56,63 @@ def train_one_epoch(model, raw_model, loader, optimizer, scaler, miner, evaluato
     total_g_loss     = 0.0
     total_c_loss     = 0.0
     total_e_loss     = 0.0
+    total_loc_loss   = 0.0
 
+    ddp     = isinstance(model, torch.nn.parallel.DistributedDataParallel)
     is_main = int(os.environ.get("LOCAL_RANK", 0)) == 0
-    pbar = tqdm(loader, desc=f"Epoch {epoch}", disable=not is_main, leave=True)
+    pbar    = tqdm(loader, desc=f"Epoch {epoch}", disable=not is_main, leave=True)
+
+    accum   = cfg.train.accum_steps
+    optimizer.zero_grad()
 
     for step, batch in enumerate(pbar):
-        optimizer.zero_grad()
+        is_accum_boundary = (step + 1) % accum == 0 or (step + 1) == len(loader)
+        sync_ctx = contextlib.nullcontext() if (not ddp or is_accum_boundary) else model.no_sync()
 
-        with autocast('cuda', enabled=cfg.train.mixed_precision):
-            # First forward pass without hard negatives to get embeddings
-            out = model(batch, neg_mining=None)
+        with sync_ctx:
+            with autocast('cuda', enabled=cfg.train.mixed_precision):
+                out = model(batch, neg_mining=None)
 
-            # Mine hard negatives using the embeddings from this forward pass
-            neg_mining = None
-            if miner is not None:
-                neg_indices, cross_image = miner.mine(
-                    batch,
-                    phrase_embeds=out["phrase_embeds"].detach(),
-                    region_embeds=out["region_embeds"].detach(),
-                )
-                neg_mining = (neg_indices, cross_image)
-                # Re-score with hard negatives informing the loss
-                out = model(batch, neg_mining=neg_mining)
+                neg_mining = None
+                if miner is not None:
+                    neg_indices, cross_image = miner.mine(
+                        batch,
+                        phrase_embeds=out["phrase_embeds"].detach(),
+                        region_embeds=out["region_embeds"].detach(),
+                    )
+                    # cross_image=True (inbatch strategy) uses flat B*N indices that
+                    # grounding_loss cannot handle — skip second forward and use plain CE.
+                    if not cross_image:
+                        neg_mining = (neg_indices, cross_image)
+                        out = model(batch, neg_mining=neg_mining)
 
-            loss = out["loss"]
+                loss = out["loss"] / accum
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(
-            raw_model.trainable_parameters, cfg.train.grad_clip
-        )
-        scaler.step(optimizer)
-        scaler.update()
+            scaler.scale(loss).backward()
 
-        total_loss   += loss.item()
-        total_g_loss += out["grounding_loss"].item()
-        total_c_loss += out["contrastive_loss"].item()
-        total_e_loss += out["entropy_loss"].item()
+        total_loss     += loss.item()
+        total_g_loss   += out["grounding_loss"].item()
+        total_c_loss   += out["contrastive_loss"].item()
+        total_e_loss   += out["entropy_loss"].item()
+        total_loc_loss += out["loc_loss"].item()
+
+        if is_accum_boundary:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                raw_model.trainable_parameters, cfg.train.grad_clip
+            )
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
 
         if step % cfg.train.log_every == 0:
             n = step + 1
             pbar.set_postfix({
-                "loss":        f"{total_loss   / n:.4f}",
-                "grounding":   f"{total_g_loss / n:.4f}",
-                "contrastive": f"{total_c_loss / n:.4f}",
-                "entropy":     f"{total_e_loss / n:.4f}",
+                "loss":        f"{total_loss     / n:.4f}",
+                "grounding":   f"{total_g_loss   / n:.4f}",
+                "contrastive": f"{total_c_loss   / n:.4f}",
+                "entropy":     f"{total_e_loss   / n:.4f}",
+                "loc":         f"{total_loc_loss / n:.4f}",
             })
 
     return total_loss / len(loader)
@@ -115,19 +128,38 @@ def evaluate(model, loader, evaluator, cfg):
     evaluator.reset()
 
     for batch in loader:
-        out      = model(batch, neg_mining=None)
-        preds    = out["preds"]                    # (B,)
-        proposals = batch["proposals"]             # (B, N, 4)
-        gt_boxes  = batch["gt_box"]               # (B, 4)
-        entity_types = batch["entity_type"]       # list[str]
+        out          = model(batch, neg_mining=None)
+        preds        = out["preds"]                              # (B,)
+        gt_boxes     = batch["gt_box"]                           # (B, 4) xyxy pixel
+        entity_types = batch["entity_type"]
 
-        evaluator.update_from_indices(
-            pred_idx=preds,
-            proposals=proposals,
-            gt_boxes=gt_boxes,
-            entity_types=entity_types,
-            scores=out["scores"].detach(),
-        )
+        # Use RPN proposals from model output if available, else batch proposals
+        proposals = out.get("proposals", batch.get("proposals"))
+
+        if proposals is not None:
+            evaluator.update_from_indices(
+                pred_idx=preds,
+                proposals=proposals,
+                gt_boxes=gt_boxes,
+                entity_types=entity_types,
+                scores=out["scores"].detach(),
+            )
+        else:
+            evaluator.update_from_indices(
+                pred_idx=preds,
+                proposals=batch["proposals"],
+                gt_boxes=gt_boxes,
+                entity_types=entity_types,
+                scores=out["scores"].detach(),
+            )
+
+        # Also evaluate direct box prediction if available
+        if "pred_boxes" in out and "gt_box_norm" in batch:
+            evaluator.update_direct_boxes(
+                pred_boxes_norm=out["pred_boxes"],
+                gt_boxes_norm=batch["gt_box_norm"],
+                entity_types=entity_types,
+            )
 
     return evaluator.compute()
 
@@ -179,6 +211,47 @@ def clip_baseline(model, loader, evaluator, cfg):
 
 
 # ---------------------------------------------------------------------------
+# Oracle recall check
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def oracle_recall(model, loader):
+    """
+    Check what fraction of GT boxes are covered by at least one RPN proposal at IoU≥0.5.
+    Target ≥0.75; if below 0.65 consider increasing max_proposals.
+    """
+    from eval.metrics import iou as compute_iou
+    hits, total = 0, 0
+    hits5 = 0
+
+    raw_model = model.module if hasattr(model, 'module') else model
+    for batch in loader:
+        device    = next(raw_model.parameters()).device
+        images    = batch["images"].to(device)
+        gt_boxes  = batch["gt_box"]                            # (B, 4) xyxy pixel
+
+        _, boxes_xyxy, mask = raw_model.rpn_encoder(images, batch["image_sizes"])
+        boxes_xyxy = boxes_xyxy.cpu()
+        mask       = mask.cpu()
+
+        for i in range(gt_boxes.size(0)):
+            gt  = gt_boxes[i]
+            n   = mask[i].sum().item()
+            props = boxes_xyxy[i, :n]
+            ious  = [compute_iou(props[j], gt) for j in range(n)]
+            hits  += any(v >= 0.5 for v in ious)
+            hits5 += any(v >= 0.5 for v in sorted(ious, reverse=True)[:5])
+            total += 1
+
+    recall    = hits  / total if total else 0.0
+    recall_r5 = hits5 / total if total else 0.0
+    print(f"  Oracle recall (any proposal IoU≥0.5): {recall:.4f}  |  R@5: {recall_r5:.4f}")
+    if recall < 0.65:
+        print("  WARNING: oracle recall < 0.65 — consider increasing max_proposals")
+    return recall
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -227,12 +300,21 @@ def main(cfg: Config):
         print(f"Trainable params : {raw_model.trainable_param_count():,}")
         print(f"Total params     : {raw_model.total_param_count():,}")
 
-    # CLIP baseline — run before DDP wrap so no collective ops are active
+    # CLIP baseline — run before DDP wrap so no collective ops are active.
+    # Requires cached mode (batch needs region_embeds / proposals).
     evaluator = GroundingEvaluator(cfg)
-    if is_main and not cfg.skip_baseline:
+    if is_main and not cfg.skip_baseline and cfg.data.use_cache:
         print("\n--- CLIP baseline (no training) ---")
         baseline = clip_baseline(raw_model, val_loader, evaluator, cfg)
         print(f"  Acc@0.5: {baseline['acc@0.5']:.4f}  |  mean IoU: {baseline['mean_iou']:.4f}")
+    elif is_main and not cfg.skip_baseline and not cfg.data.use_cache:
+        print("\n--- CLIP baseline skipped (requires cached embeddings) ---")
+
+    # Oracle recall check (only in uncached / RPN mode)
+    if is_main and not cfg.data.use_cache and not cfg.skip_baseline:
+        print("\n--- Oracle RPN recall check ---")
+        oracle_recall(raw_model, val_loader)
+
     if ddp:
         dist.barrier()  # all ranks wait for rank 0 to finish baseline
 
@@ -242,12 +324,17 @@ def main(cfg: Config):
     else:
         model = raw_model
 
-    # Optimizer (only trainable params)
-    optimizer = torch.optim.AdamW(
-        raw_model.trainable_parameters,
-        lr=cfg.train.lr,
-        weight_decay=cfg.train.weight_decay,
-    )
+    # Optimizer — per-module learning rates
+    head = raw_model.head
+    optimizer = torch.optim.AdamW([
+        {"params": head.text_proj.parameters(),      "lr": 1e-4},
+        {"params": head.token_weighter.parameters(), "lr": 1e-4},
+        {"params": head.region_proj.parameters(),    "lr": 2e-4},
+        {"params": head.layers.parameters(),         "lr": 2e-4},
+        {"params": head.scorer.parameters(),         "lr": 1e-4},
+        {"params": head.box_head.parameters(),       "lr": 3e-4},
+        {"params": raw_model.box_pos_enc.parameters(), "lr": 3e-4},
+    ], weight_decay=cfg.train.weight_decay)
     scaler = GradScaler('cuda', enabled=cfg.train.mixed_precision)
     miner  = NegativeMiner(cfg, clip_model=raw_model.encoder.clip)
 
@@ -267,10 +354,7 @@ def main(cfg: Config):
     if cfg.resume:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            ckpt = torch.load(cfg.resume, map_location=device, weights_only=False)
-            raw_model.head.load_state_dict(ckpt["head_state"])
-            if "optimizer" in ckpt:
-                optimizer.load_state_dict(ckpt["optimizer"])
+            ckpt = raw_model.load(cfg.resume, optimizer=optimizer)
             if "scheduler" in ckpt:
                 scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt["epoch"] + 1
@@ -303,6 +387,18 @@ def main(cfg: Config):
         if epoch % cfg.train.save_every == 0 and is_main:
             raw_model.save(run_dir / f"epoch_{epoch:03d}.pt", epoch, scheduler=scheduler)
 
+        # Unfreeze RPN head after epoch 10
+        if epoch == 10:
+            for p in raw_model.rpn_encoder.detector.rpn.parameters():
+                p.requires_grad = True
+            optimizer.add_param_group({
+                "params": [p for p in raw_model.rpn_encoder.detector.rpn.parameters()
+                           if p.requires_grad],
+                "lr": 1e-5,
+            })
+            if is_main:
+                print("  ** Unfroze RPN head (lr=1e-5)")
+
         if ddp:
             dist.barrier()  # wait for rank 0 to finish eval/checkpoint before next epoch
 
@@ -329,6 +425,8 @@ if __name__ == "__main__":
                         help="skip CLIP baseline eval before training")
     parser.add_argument("--resume", default=None,
                         help="path to checkpoint to resume training from")
+    parser.add_argument("--accum_steps", type=int, default=None,
+                        help="gradient accumulation steps (default: 1)")
     args = parser.parse_args()
 
     cfg = DEFAULT_CONFIG
@@ -338,7 +436,8 @@ if __name__ == "__main__":
     if args.head_depth    is not None: cfg.model.head_depth   = args.head_depth
     if args.use_cache     is not None: cfg.data.use_cache     = args.use_cache
     if args.data_fraction is not None: cfg.data.data_fraction = args.data_fraction
-    if args.skip_baseline: cfg.skip_baseline = args.skip_baseline
-    if args.resume:        cfg.resume        = args.resume
+    if args.skip_baseline: cfg.skip_baseline          = args.skip_baseline
+    if args.resume:        cfg.resume                  = args.resume
+    if args.accum_steps is not None: cfg.train.accum_steps = args.accum_steps
 
     main(cfg)

@@ -28,11 +28,37 @@ import torch.nn.functional as F
 from config import Config
 from .encoder import FrozenCLIPEncoder
 from .head import GroundingHead
+from .rpn_encoder import RPNRegionEncoder
+from .box_encoding import BoxPositionalEncoding, xyxy_pixel_to_cxcywh_norm
 from .losses import (
     grounding_loss,
-    hard_negative_contrastive_loss,
+    inbatch_contrastive_loss,
     token_entropy_loss,
+    localization_loss,
 )
+
+
+def _compute_pos_idx(proposals: torch.Tensor,   # (B, N, 4) xyxy pixel
+                     gt_boxes:  torch.Tensor,   # (B, 4)   xyxy pixel
+                     mask:      torch.Tensor,   # (B, N) bool
+                     ) -> torch.Tensor:         # (B,) long
+    """Find the proposal with highest IoU to gt_box for each image."""
+    B, N, _ = proposals.shape
+    # Use vectorised IoU: broadcast (B, N, 4) vs (B, 1, 4)
+    gt = gt_boxes.unsqueeze(1)                                    # (B, 1, 4)
+    inter_x1 = torch.max(proposals[..., 0], gt[..., 0])
+    inter_y1 = torch.max(proposals[..., 1], gt[..., 1])
+    inter_x2 = torch.min(proposals[..., 2], gt[..., 2])
+    inter_y2 = torch.min(proposals[..., 3], gt[..., 3])
+    inter    = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)  # (B, N)
+    area_p   = ((proposals[..., 2] - proposals[..., 0]) *
+                (proposals[..., 3] - proposals[..., 1])).clamp(0)
+    area_g   = ((gt_boxes[..., 2] - gt_boxes[..., 0]) *
+                (gt_boxes[..., 3] - gt_boxes[..., 1])).clamp(0).unsqueeze(1)
+    union    = area_p + area_g - inter
+    iou      = torch.where(union > 0, inter / union, torch.zeros_like(inter))
+    iou      = iou.masked_fill(~mask, -1.0)
+    return iou.argmax(dim=1)                                      # (B,)
 
 
 class GroundingModel(nn.Module):
@@ -51,114 +77,101 @@ class GroundingModel(nn.Module):
             region_proj_dim=self.encoder.projection_dim,    # 512 for ViT-B/32
         )
 
+        self.rpn_encoder = RPNRegionEncoder(
+            out_dim=self.encoder.projection_dim,
+            max_proposals=config.model.max_proposals,
+            frozen=True,
+        )
+        self.box_pos_enc = BoxPositionalEncoding(d_model=config.model.embed_dim)
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
-    def forward(self,
-                batch:       dict,
-                neg_mining:  Optional[Tuple[torch.Tensor, bool]] = None,
-                ) -> dict:
+    def forward(self, batch: dict) -> dict:
         """
         Args:
-            batch: dict produced by data.collate_fn with keys:
-                phrase_tokens   : (B, 77)
-                proposal_crops  : (B, N, 3, H, W)
-                proposals       : (B, N, 4)
-                proposal_mask   : (B, N) bool
-                pos_idx         : (B,)
-                gt_box          : (B, 4)
-                image_id        : list[str]
-                phrase          : list[str]
-                entity_type     : list[str]
-
-            neg_mining: optional tuple (neg_indices, cross_image) from
-                NegativeMiner.mine(). Pass None to use plain cross-entropy.
-                    neg_indices  : (B, K) LongTensor
-                    cross_image  : bool
+            batch: dict from data.collate_fn (uncached/RPN path only):
+                phrase_tokens : (B, 77)
+                images        : (B, 3, 224, 224)
+                image_sizes   : list of (H, W) tuples
+                proposals     : (B, N, 4)   xyxy pixel — for eval
+                proposal_mask : (B, N) bool
+                pos_idx       : (B,)
+                gt_box        : (B, 4)      xyxy pixel
+                gt_box_norm   : (B, 4)      normalized cxcywh
+                entity_type   : list[str]
 
         Returns dict:
-            scores           : (B, N)  — raw grounding logits (padding → -inf)
-            loss             : scalar  — weighted total loss
-            grounding_loss   : scalar  — CE component (detached, for logging)
-            contrastive_loss : scalar  — hard-neg InfoNCE component (detached)
-            entropy_loss     : scalar  — token entropy component (detached)
-            preds            : (B,)    — argmax predicted proposal index
-            token_weights    : (B, L)  — per-token importance weights (detached)
-            phrase_embeds    : (B, D)  — L2-normed phrase embeddings (for miner)
-            region_embeds    : (B, N, D) — L2-normed region embeddings (for miner)
+            scores           : (B, N)
+            loss             : scalar
+            grounding_loss   : scalar (detached, for logging)
+            contrastive_loss : scalar (detached, for logging)
+            entropy_loss     : scalar (detached, for logging)
+            loc_loss         : scalar (detached, for logging)
+            pred_boxes       : (B, 4)
+            preds            : (B,)
+            proposals        : (B, N, 4)  RPN boxes (for eval)
         """
         device = next(self.head.parameters()).device
 
         phrase_tokens = batch["phrase_tokens"].to(device)         # (B, 77)
-        pos_idx       = batch["pos_idx"].to(device)               # (B,)
+        attn_mask     = (phrase_tokens != 0).to(device)           # (B, 77)
+        images        = batch["images"].to(device)                # (B, 3, 224, 224)
+        image_sizes   = batch["image_sizes"]
 
-        proposal_mask = batch.get("proposal_mask")
-        if proposal_mask is not None:
-            proposal_mask = proposal_mask.to(device)              # (B, N) bool
+        # ---- RPN encode ----
+        rpn_feats, rpn_boxes_xyxy, rpn_mask = self.rpn_encoder(images, image_sizes)
 
-        # Attention mask: 1 for real tokens, 0 for padding (CLIP pads with 0)
-        attn_mask = (phrase_tokens != 0).to(device)               # (B, 77)
+        # Recompute pos_idx against RPN box order
+        gt_box_xyxy = batch["gt_box"].to(device)                  # (B, 4) pixel xyxy
+        pos_idx     = _compute_pos_idx(rpn_boxes_xyxy, gt_box_xyxy, rpn_mask)
 
-        # ---- Encode — skip if pre-computed embeddings are in the batch ----
-        if "text_hidden" in batch and "region_embeds" in batch:
-            text_hidden   = batch["text_hidden"].to(device)       # (B, L, D_text)
-            region_embeds = batch["region_embeds"].to(device)     # (B, N, D_proj)
-            phrase_embeds = batch["phrase_embed"].to(device)      # (B, D_proj)
-        else:
-            proposal_crops = batch["proposal_crops"].to(device)   # (B, N, 3, H, W)
-            text_hidden    = self.encoder.encode_text(phrase_tokens, attn_mask)
-            region_embeds  = self.encoder.encode_region(proposal_crops)
-            phrase_embeds  = self.encoder.encode_phrase(phrase_tokens, attn_mask)
+        # Positional encoding on normalized boxes
+        boxes_norm    = xyxy_pixel_to_cxcywh_norm(rpn_boxes_xyxy, image_size=224)
+        pos_enc       = self.box_pos_enc(boxes_norm)              # (B, N, D)
+        region_embeds = self.encoder.encode_region_from_features(
+            rpn_feats + pos_enc
+        )                                                         # (B, N, D_proj)
 
-        # ---- Score ----
-        # head now returns (scores, token_weights, query)
-        scores, token_weights, query = self.head(
+        text_hidden   = self.encoder.encode_text(phrase_tokens, attn_mask)
+        phrase_embeds = self.encoder.encode_phrase(phrase_tokens, attn_mask)
+
+        # ---- Head ----
+        scores, token_weights, query, pred_boxes = self.head(
             text_hidden=text_hidden,
             region_embeds=region_embeds,
             text_mask=attn_mask,
-            proposal_mask=proposal_mask,
-        )                                                           # (B,N), (B,L), (B,D)
+            proposal_mask=rpn_mask,
+        )                                                         # (B,N), (B,L), (B,D), (B,4)
 
-        # ---- Loss 1: grounding loss (CE over proposals) ----
-        neg_indices = None
-        cross_image = False
-        if neg_mining is not None:
-            neg_indices, cross_image = neg_mining
-            if neg_indices is not None:
-                neg_indices = neg_indices.to(device)
+        cfg_m = self.cfg.model
 
-        g_loss = grounding_loss(scores, pos_idx, neg_indices, cross_image)
+        # ---- Loss 1: grounding CE ----
+        g_loss = grounding_loss(scores, pos_idx)
 
-        # ---- Loss 2: hard-negative contrastive loss ----
-        # Use the frozen CLIP phrase embedding (already L2-normalised) so the
-        # contrastive loss does not conflict with the grounding head's own scorer.
-        # region_embeds are already L2-normalised from encode_region().
-        phrase_q      = F.normalize(phrase_embeds, dim=-1)          # (B, D)
-        region_norm   = region_embeds                               # (B, N, D) already normed
-        cfg_m         = self.cfg.model
-        c_loss = hard_negative_contrastive_loss(
-            phrase_embeds=phrase_q,
-            region_embeds=region_norm,
+        # ---- Loss 2: in-batch contrastive ----
+        c_loss = inbatch_contrastive_loss(
+            phrase_embeds=phrase_embeds,
+            region_embeds=region_embeds,
             pos_idx=pos_idx,
-            proposal_mask=proposal_mask if proposal_mask is not None
-                          else torch.ones(scores.shape, dtype=torch.bool, device=device),
-            k=cfg_m.hard_neg_k,
+            proposal_mask=rpn_mask,
             temperature=cfg_m.contrastive_temperature,
-            penalty_factor=cfg_m.hard_neg_penalty,
         )
 
-        # ---- Loss 3: token entropy regularisation ----
+        # ---- Loss 3: token entropy ----
         e_loss = token_entropy_loss(token_weights, attn_mask.bool())
 
-        # ---- Combine ----
+        # ---- Loss 4: localization ----
+        gt_box_norm = batch["gt_box_norm"].to(device)             # (B, 4) normalized cxcywh
+        loc_loss    = localization_loss(pred_boxes, gt_box_norm)
+
         total = (
             g_loss
-            + cfg_m.contrastive_loss_weight * c_loss
-            + cfg_m.entropy_loss_weight     * e_loss
+            + cfg_m.contrastive_loss_weight  * c_loss
+            + cfg_m.entropy_loss_weight      * e_loss
+            + cfg_m.localization_loss_weight * loc_loss
         )
-
-        preds = scores.argmax(dim=1)                                # (B,)
 
         return {
             "scores":           scores,
@@ -166,10 +179,10 @@ class GroundingModel(nn.Module):
             "grounding_loss":   g_loss.detach(),
             "contrastive_loss": c_loss.detach(),
             "entropy_loss":     e_loss.detach(),
-            "preds":            preds,
-            "token_weights":    token_weights.detach(),
-            "phrase_embeds":    phrase_embeds,
-            "region_embeds":    region_embeds,
+            "loc_loss":         loc_loss.detach(),
+            "pred_boxes":       pred_boxes.detach(),
+            "preds":            scores.argmax(dim=1),
+            "proposals":        rpn_boxes_xyxy.detach(),
         }
 
     # ------------------------------------------------------------------
@@ -179,10 +192,12 @@ class GroundingModel(nn.Module):
     def save(self, path: Path, epoch: int,
              optimizer=None, scheduler=None, metrics: dict = None):
         ckpt = {
-            "epoch":      epoch,
-            "head_state": self.head.state_dict(),
-            "config":     self.cfg,
-            "metrics":    metrics or {},
+            "epoch":         epoch,
+            "head_state":    self.head.state_dict(),
+            "rpn_state":     self.rpn_encoder.state_dict(),
+            "box_enc_state": self.box_pos_enc.state_dict(),
+            "config":        self.cfg,
+            "metrics":       metrics or {},
         }
         if optimizer is not None:
             ckpt["optimizer"] = optimizer.state_dict()
@@ -193,12 +208,15 @@ class GroundingModel(nn.Module):
 
     def load(self, path: Path, optimizer=None) -> dict:
         """
-        Load head weights from a checkpoint.
+        Load weights from a checkpoint.
         Returns the full checkpoint dict (caller can inspect epoch, metrics, etc.).
         """
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        # strict=True by default — will error if architecture changed
-        self.head.load_state_dict(ckpt["head_state"], strict=True)
+        self.head.load_state_dict(ckpt["head_state"], strict=False)
+        if "rpn_state" in ckpt:
+            self.rpn_encoder.load_state_dict(ckpt["rpn_state"], strict=False)
+        if "box_enc_state" in ckpt:
+            self.box_pos_enc.load_state_dict(ckpt["box_enc_state"], strict=False)
         if optimizer is not None and "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
         return ckpt
@@ -209,8 +227,11 @@ class GroundingModel(nn.Module):
 
     @property
     def trainable_parameters(self):
-        """Parameters to pass to the optimizer — head only."""
-        return self.head.trainable_parameters()
+        """Parameters to pass to the optimizer — head + box_pos_enc."""
+        return (
+            [p for p in self.head.parameters() if p.requires_grad]
+            + list(self.box_pos_enc.parameters())
+        )
 
     def trainable_param_count(self) -> int:
         return sum(p.numel() for p in self.trainable_parameters)

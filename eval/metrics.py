@@ -82,6 +82,9 @@ class GroundingEvaluator:
         self._entity_types: List[str]   = []
         self._ap_scores:    List[float] = []   # per-phrase AP for mAP50
         self._recall5:      List[bool]  = []   # any of top-5 correct at IoU≥0.5
+        # Direct box prediction metrics (normalized cxcywh)
+        self._direct_ious:      List[float] = []
+        self._direct_correct_50: List[bool] = []
 
     def set_baseline(self, baseline_acc: float):
         """
@@ -151,6 +154,25 @@ class GroundingEvaluator:
                 self._ap_scores.append(ap)
                 self._recall5.append(r5)
 
+    def update_direct_boxes(self,
+                            pred_boxes_norm: torch.Tensor,   # (B, 4) normalized cxcywh
+                            gt_boxes_norm:   torch.Tensor,   # (B, 4) normalized cxcywh
+                            entity_types:    List[str],
+                            ):
+        """Accumulate metrics for the direct box-prediction head (normalized cxcywh)."""
+        pred_boxes_norm = pred_boxes_norm.cpu()
+        gt_boxes_norm   = gt_boxes_norm.cpu()
+
+        # Convert cxcywh → xyxy for IoU computation
+        def to_xyxy(b):
+            cx, cy, w, h = b[0].item(), b[1].item(), b[2].item(), b[3].item()
+            return torch.tensor([cx - w/2, cy - h/2, cx + w/2, cy + h/2])
+
+        for i in range(pred_boxes_norm.size(0)):
+            score = iou(to_xyxy(pred_boxes_norm[i]), to_xyxy(gt_boxes_norm[i]))
+            self._direct_ious.append(score)
+            self._direct_correct_50.append(score >= self.threshold_high)
+
     # ------------------------------------------------------------------
     # Compute
     # ------------------------------------------------------------------
@@ -202,4 +224,11 @@ class GroundingEvaluator:
         if self._ap_scores:
             out["mAP50"]     = round(sum(self._ap_scores) / len(self._ap_scores), 4)
             out["recall@5"]  = round(sum(self._recall5)   / len(self._recall5),   4)
+        if self._direct_correct_50:
+            out["direct_acc@0.5"] = round(
+                sum(self._direct_correct_50) / len(self._direct_correct_50), 4
+            )
+            out["direct_mean_iou"] = round(
+                sum(self._direct_ious) / len(self._direct_ious), 4
+            )
         return out

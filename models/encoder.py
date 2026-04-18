@@ -86,30 +86,6 @@ class FrozenCLIPEncoder(nn.Module):
         features = self.clip.visual_projection(hidden)
         return features
 
-    @torch.no_grad()
-    def encode_region(self, proposal_crops: torch.Tensor) -> torch.Tensor:
-        """
-        Encode a padded batch of cropped region proposals.
-
-        Args:
-            proposal_crops: (B, N, 3, H, W)
-
-        Returns:
-            region_embeds: (B, N, projection_dim) — CLS embedding per crop, L2-normalised
-
-        We use only the CLS token because each crop is already spatially isolated —
-        the CLS token aggregates the full crop's content. The patch tokens would
-        add compute with minimal benefit at this granularity.
-        """
-        B, N, C, H, W = proposal_crops.shape
-
-        # Merge batch and proposal dims so we can run one forward pass
-        flat     = proposal_crops.view(B * N, C, H, W)
-        features = self.encode_image(flat)          # (B*N, N_patches+1, D_proj)
-        cls      = features[:, 0, :]               # (B*N, D_proj) — CLS token only
-        cls      = cls.view(B, N, -1)              # (B, N, D_proj)
-        return F.normalize(cls, dim=-1)
-
     # ------------------------------------------------------------------
     # Text encoding
     # ------------------------------------------------------------------
@@ -136,6 +112,17 @@ class FrozenCLIPEncoder(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
         ).last_hidden_state   # (B, L, text_hidden_dim)
+
+    def encode_region_from_features(self, feats: torch.Tensor) -> torch.Tensor:
+        """
+        L2-normalise precomputed region features from the RPN encoder.
+
+        Args:
+            feats : (B, N, D) — already projected into projection_dim space
+        Returns:
+            (B, N, D) L2-normalised
+        """
+        return F.normalize(feats, dim=-1)
 
     @torch.no_grad()
     def encode_phrase(self, input_ids: torch.Tensor,

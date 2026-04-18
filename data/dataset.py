@@ -206,11 +206,20 @@ class Flickr30kGroundingDataset(Dataset):
         self.cfg       = config
         self.split     = split
         self.tokenizer = tokenizer
+        # CLIP preprocessing (used for proposal crops in cached mode)
         self.transform = transforms.Compose([
             transforms.Resize((config.data.image_size, config.data.image_size)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                  std=[0.26862954, 0.26130258, 0.27577711]),
+        ])
+        # ImageNet preprocessing for full image passed to RPN (uncached mode)
+        self.image_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225]),
         ])
 
         # --- Load HuggingFace dataset and filter to requested split ---
@@ -323,12 +332,17 @@ class Flickr30kGroundingDataset(Dataset):
                     "phrase_embed":  phrase_embed,
                 }
 
-        # ---- Fallback: compute on the fly ----
-        image  = hf_row["image"].convert("RGB")
-        proposals = get_proposals(image, img_id, method,
-                                  self.cfg.data.max_proposals)
-        pos_idx        = _find_best_proposal(proposals, gt_box)
-        proposal_crops = _crop_proposals(image, proposals, self.transform)
+        # ---- Fallback: compute on the fly via RPN path ----
+        image     = hf_row["image"].convert("RGB")
+        # Normalised cxcywh gt_box for localization loss (image resized to 224)
+        W, H      = image.size
+        gt_box_norm = _xyxy_pixel_to_cxcywh_norm(gt_box, W, H)
+
+        image_tensor = self.image_transform(image)  # (3, 224, 224) ImageNet-normalised
+
+        # Keep pre-computed proposals + pos_idx for eval/grounding-loss fallback
+        proposals = get_proposals(image, img_id, method, self.cfg.data.max_proposals)
+        pos_idx   = _find_best_proposal(proposals, gt_box)
 
         phrase_tokens = self.tokenizer(
             phrase_dict["phrase"],
@@ -339,20 +353,32 @@ class Flickr30kGroundingDataset(Dataset):
         ).input_ids.squeeze(0)
 
         return {
-            "image_id":       img_id,
-            "phrase":         phrase_dict["phrase"],
-            "phrase_tokens":  phrase_tokens,
-            "proposals":      proposals,
-            "proposal_crops": proposal_crops,
-            "pos_idx":        pos_idx,
-            "gt_box":         gt_box,
-            "entity_type":    phrase_dict["entity_type"],
+            "image_id":     img_id,
+            "phrase":       phrase_dict["phrase"],
+            "phrase_tokens": phrase_tokens,
+            "proposals":    proposals,
+            "pos_idx":      pos_idx,
+            "gt_box":       gt_box,
+            "gt_box_norm":  gt_box_norm,
+            "entity_type":  phrase_dict["entity_type"],
+            "images":       image_tensor,
+            "image_sizes":  (224, 224),
         }
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _xyxy_pixel_to_cxcywh_norm(box: torch.Tensor, W: int, H: int) -> torch.Tensor:
+    """Convert a single (4,) xyxy pixel box to normalized cxcywh given image W, H."""
+    x1, y1, x2, y2 = box.tolist()
+    cx = (x1 + x2) / 2 / W
+    cy = (y1 + y2) / 2 / H
+    w  = (x2 - x1) / W
+    h  = (y2 - y1) / H
+    return torch.tensor([cx, cy, w, h], dtype=torch.float32).clamp(0.0, 1.0)
+
 
 def _iou(box_a: torch.Tensor, box_b: torch.Tensor) -> float:
     xa = max(box_a[0].item(), box_b[0].item())
@@ -399,7 +425,6 @@ def collate_fn(batch: List[dict]) -> dict:
 
     padded_proposals = []
     masks            = []
-    padded_crops     = []          # only populated in uncached mode
     padded_regions   = []          # only populated in cached mode
 
     for item in batch:
@@ -413,8 +438,6 @@ def collate_fn(batch: List[dict]) -> dict:
         if use_cache:
             # region_embeds: (N, D) → pad to (max_n, D)
             padded_regions.append(F.pad(item["region_embeds"], (0, 0, 0, pad)))
-        else:
-            padded_crops.append(F.pad(item["proposal_crops"], (0, 0, 0, 0, 0, 0, 0, pad)))
 
     out = {
         "image_id":      [item["image_id"]    for item in batch],
@@ -432,6 +455,9 @@ def collate_fn(batch: List[dict]) -> dict:
         out["region_embeds"] = torch.stack(padded_regions)
         out["phrase_embed"]  = torch.stack([item["phrase_embed"]  for item in batch])
     else:
-        out["proposal_crops"] = torch.stack(padded_crops)
+        # RPN path: full images + normalized gt boxes for localization loss
+        out["images"]      = torch.stack([item["images"]      for item in batch])
+        out["image_sizes"] = [item["image_sizes"] for item in batch]
+        out["gt_box_norm"] = torch.stack([item["gt_box_norm"] for item in batch])
 
     return out

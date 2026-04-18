@@ -1,142 +1,111 @@
 """
 models/losses.py — all loss functions for the grounding model.
 
-Three losses:
-
-  grounding_loss()
-      Original cross-entropy / hard-negative CE over proposal scores.
-      Supports three modes (plain CE, per-image hard negs, cross-batch hard negs).
-
-  hard_negative_contrastive_loss()
-      InfoNCE-style loss that explicitly penalises the top-k wrong-but-high-scoring
-      regions (hard negatives) for each phrase.
-      Applied on L2-normalised phrase embeddings vs region embeddings.
-
-  token_entropy_loss()
-      Entropy minimisation on token weights from TokenWeightingMLP.
-      Encourages the model to focus on important words rather than spreading weight
-      uniformly across all tokens.
+  grounding_loss()        — cross-entropy over proposal scores (plain CE).
+  inbatch_contrastive_loss() — cross-batch InfoNCE: phrase vs all regions in batch.
+  token_entropy_loss()    — entropy minimisation on token weights.
+  localization_loss()     — L1 + GIoU on direct box prediction.
 """
 
-import math
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
+from torchvision.ops import generalized_box_iou
 
 
 # ---------------------------------------------------------------------------
 # Grounding loss (moved from head.py — unchanged)
 # ---------------------------------------------------------------------------
 
-def grounding_loss(scores:       torch.Tensor,                   # (B, N)
-                   pos_idx:      torch.Tensor,                   # (B,)
-                   neg_indices:  Optional[torch.Tensor] = None,  # (B, K)
-                   cross_image:  bool = False,
+def box_cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+    """Convert (..., 4) cxcywh → (..., 4) xyxy."""
+    cx, cy, w, h = boxes.unbind(-1)
+    return torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1)
+
+
+def localization_loss(pred_boxes:   torch.Tensor,   # (B, 4) normalized cxcywh
+                      target_boxes:  torch.Tensor,   # (B, 4) normalized cxcywh
+                      lambda_l1:    float = 5.0,
+                      lambda_giou:  float = 2.0,
+                      ) -> torch.Tensor:
+    """
+    L1 + GIoU localization loss on normalized cxcywh boxes.
+    Clamps predicted w/h to ≥1e-4 to avoid zero-area boxes in GIoU.
+    """
+    # Clamp w and h to avoid degenerate boxes
+    cx, cy, w, h = pred_boxes.unbind(-1)
+    pred_boxes = torch.stack([cx, cy, w.clamp(min=1e-4), h.clamp(min=1e-4)], dim=-1)
+
+    loss_l1 = F.l1_loss(pred_boxes, target_boxes, reduction='mean')
+
+    pred_xyxy   = box_cxcywh_to_xyxy(pred_boxes)
+    target_xyxy = box_cxcywh_to_xyxy(target_boxes)
+    giou_matrix = generalized_box_iou(pred_xyxy, target_xyxy)   # (B, B)
+    loss_giou   = (1 - giou_matrix.diagonal()).mean()
+
+    return lambda_l1 * loss_l1 + lambda_giou * loss_giou
+
+
+def grounding_loss(scores:  torch.Tensor,   # (B, N)
+                   pos_idx: torch.Tensor,   # (B,)
                    ) -> torch.Tensor:
-    """
-    Grounding loss supporting three modes:
-
-    Mode A — neg_indices is None:
-        Plain cross-entropy treating all N proposals as the softmax class space.
-
-    Mode B — neg_indices provided, cross_image=False:
-        Per-image hard negatives. Build [pos_score | neg_scores] and apply CE
-        with label 0 (positive always first).
-
-    Mode C — neg_indices provided, cross_image=True:
-        Cross-batch hard negatives. Flat indices into (B*N,) space; converted to
-        per-image indices internally before gathering scores.
-    """
+    """Plain cross-entropy over all N proposal scores."""
     B, N = scores.shape
-    device = scores.device
-    pos_idx = pos_idx.clamp(0, N - 1)  # guard against edge cases
-
-    if neg_indices is None:
-        return F.cross_entropy(scores, pos_idx)
-
-    batch_idx  = torch.arange(B, device=device)
-    pos_scores = scores[batch_idx, pos_idx].unsqueeze(1)              # (B, 1)
-
-    # cross_image=True means flat (B*N) indices — strip image info and treat as
-    # per-image proposal indices. Cross-image scores can't be read from the (B,N)
-    # scores matrix without re-running the head, so we score them against the
-    # current image; the CLIP-similarity-based selection still picks hard proposals.
-    neg_indices = neg_indices % N if cross_image else neg_indices
-    neg_indices = neg_indices.clamp(0, N - 1)
-    neg_scores  = scores[
-        batch_idx.unsqueeze(1).expand_as(neg_indices),
-        neg_indices,
-    ]                                                                   # (B, K)
-    logits = torch.cat([pos_scores, neg_scores], dim=1)                # (B, 1+K)
-    labels = torch.zeros(B, dtype=torch.long, device=device)
-    return F.cross_entropy(logits, labels)
+    return F.cross_entropy(scores, pos_idx.clamp(0, N - 1))
 
 
 # ---------------------------------------------------------------------------
-# Hard-negative contrastive loss
+# In-batch contrastive loss
 # ---------------------------------------------------------------------------
 
-def hard_negative_contrastive_loss(
-    phrase_embeds:  torch.Tensor,           # (B, D)  L2-normalised
-    region_embeds:  torch.Tensor,           # (B, N, D)  L2-normalised
-    pos_idx:        torch.Tensor,           # (B,)  int64
-    proposal_mask:  torch.Tensor,           # (B, N)  bool, True = valid region
-    k:              int   = 4,
+def inbatch_contrastive_loss(
+    phrase_embeds:  torch.Tensor,   # (B, D)  L2-normalised
+    region_embeds:  torch.Tensor,   # (B, N, D)  L2-normalised
+    pos_idx:        torch.Tensor,   # (B,)  int64
+    proposal_mask:  torch.Tensor,   # (B, N)  bool, True = valid region
     temperature:    float = 0.07,
-    penalty_factor: float = 1.5,
 ) -> torch.Tensor:
     """
-    InfoNCE-style contrastive loss that penalises hard negatives more.
+    Cross-batch InfoNCE loss.
 
-    For each phrase in the batch:
-      1. Compute cosine similarity to every region in the same image.
-      2. Mask out the ground-truth positive and any padding proposals.
-      3. Select the top-k highest-scoring wrong regions (hard negatives).
-      4. Scale hard-negative logits by penalty_factor (>1 → harder problem).
-      5. Apply cross-entropy with the positive at index 0.
+    For phrase i the positive is region_embeds[i, pos_idx[i]].
+    Negatives are every valid proposal from every *other* image in the batch,
+    giving B*(N-1) negatives per phrase instead of just N-1 within one image.
 
-    If fewer than k valid negatives exist for an item (e.g., only 1 region),
-    the surplus logit slots are -inf → exp(-inf)=0, which is safe for CE.
+    Implementation:
+      1. Flatten regions to (B*N, D) and compute (B, B*N) similarity matrix.
+      2. Mark positive slot for each phrase: flat index = i*N + pos_idx[i].
+      3. Mask own-image slots and padding to -inf (but keep the positive).
+      4. cross_entropy with label = positive flat index.
+
+    If B==1 there are no cross-image negatives; returns a graph-connected zero.
     """
     B, N, D = region_embeds.shape
     device  = phrase_embeds.device
 
-    # Cosine similarity: (B, D) × (B, N, D) → (B, N)
-    # phrase_embeds and region_embeds are already L2-normalised
-    sim = torch.einsum("bd,bnd->bn", phrase_embeds, region_embeds)   # (B, N)
-
-    # Positive scores
-    batch_idx  = torch.arange(B, device=device)
-    pos_idx_   = pos_idx.clamp(0, N - 1)
-    pos_scores = sim.gather(1, pos_idx_.unsqueeze(1)).squeeze(1)      # (B,)
-
-    # Hard-negative mask: valid region AND not the positive
-    pos_one_hot = torch.zeros(B, N, dtype=torch.bool, device=device)
-    pos_one_hot.scatter_(1, pos_idx_.unsqueeze(1), True)
-    neg_mask = proposal_mask & ~pos_one_hot                           # (B, N)
-
-    # Guard: if no valid negatives exist, return a graph-connected zero so DDP
-    # allreduces complete on all ranks (a detached constant breaks DDP sync).
-    if k == 0 or not neg_mask.any():
+    if B == 1:
         return (phrase_embeds.sum() + region_embeds.sum()) * 0.0
 
-    # Set invalid / positive positions to -inf, then take top-k
-    sim_neg  = sim.masked_fill(~neg_mask, float("-inf"))              # (B, N)
-    actual_k = min(k, N - 1)
-    topk_scores, _ = sim_neg.topk(actual_k, dim=1)                   # (B, k)
+    flat_regions = region_embeds.view(B * N, D)                        # (B*N, D)
+    sim = torch.mm(phrase_embeds, flat_regions.t()) / temperature      # (B, B*N)
 
-    # Temperature-scale then apply penalty as additive logit offset.
-    # Multiplicative scaling on raw similarities is wrong because it changes
-    # the sign of negative similarities, making easy negatives even easier.
-    log_penalty = math.log(penalty_factor)
-    pos_logit  = pos_scores / temperature                             # (B,)
-    neg_logits = topk_scores / temperature + log_penalty             # (B, k)
+    # Flat index of each phrase's positive proposal
+    batch_idx = torch.arange(B, device=device)
+    pos_flat  = batch_idx * N + pos_idx.clamp(0, N - 1)               # (B,)
 
-    # [pos | hard_negs] → (B, 1+k), label=0 (positive always first)
-    all_logits = torch.cat([pos_logit.unsqueeze(1), neg_logits], dim=1)
-    labels     = torch.zeros(B, dtype=torch.long, device=device)
-    return F.cross_entropy(all_logits, labels)
+    # Build validity mask: True = kept in denominator
+    # Start valid, then mask own-image slots, then mask padding
+    valid = torch.ones(B, B * N, dtype=torch.bool, device=device)
+    for i in range(B):
+        valid[i, i * N : i * N + N] = False
+    flat_mask = proposal_mask.reshape(B * N)                           # (B*N,)
+    valid &= flat_mask.unsqueeze(0)                                    # (B, B*N)
+    # Always keep positive slot (it belongs to own image but is our target)
+    valid[batch_idx, pos_flat] = True
+
+    sim = sim.masked_fill(~valid, float("-inf"))
+    return F.cross_entropy(sim, pos_flat)
 
 
 # ---------------------------------------------------------------------------

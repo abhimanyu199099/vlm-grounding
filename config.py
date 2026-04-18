@@ -71,14 +71,19 @@ class ModelConfig:
     # Token-weighting MLP
     token_weighter_hidden_dim: int = 64   # hidden size of the per-token scalar MLP
 
-    # Hard-negative contrastive loss
-    hard_neg_k:              int   = 4     # top-k wrong regions to use as hard negatives
-    hard_neg_penalty:        float = 1.5  # logit scale for hard negatives (>1 = harder)
+    # In-batch contrastive loss
     contrastive_temperature: float = 0.07 # InfoNCE temperature
     contrastive_loss_weight: float = 0.5  # weight of contrastive loss in total loss
 
     # Token-focused entropy loss
     entropy_loss_weight:     float = 0.1  # weight of entropy regularisation in total loss
+
+    # Localization loss (L1 + GIoU on direct box prediction)
+    localization_loss_weight: float = 1.0
+
+    # RPN / proposal settings
+    max_proposals:  int = 64
+    rpn_backbone:   str = 'resnet18'
 
 
 # ---------------------------------------------------------------------------
@@ -89,13 +94,9 @@ class ModelConfig:
 class DataConfig:
     max_proposals:      int   = 30     # max region proposals per image
     proposal_method:    Literal["selective_search", "grid"] = "grid"
-    neg_strategy:       Literal["inbatch", "clip_mined", "cross_image", "all"] = "inbatch"
-    clip_mine_topk:     int   = 5      # how many hard negatives to mine per phrase via CLIP
-    cross_image_pool:   int   = 50     # images to sample cross-image negatives from
     image_size:         int   = 224
     num_workers:        int   = 1
     pin_memory:         bool  = True
-    use_cache:          bool  = True  # load precomputed CLIP embeddings from CACHE_DIR if available
     data_fraction:      float = 1.0   # random subset of training data (1.0 = full dataset)
 
 
@@ -111,6 +112,7 @@ class TrainConfig:
     weight_decay:   float = 1e-2
     warmup_steps:   int   = 500
     grad_clip:      float = 1.0
+    accum_steps:    int   = 1          # gradient accumulation steps (1 = no accumulation)
     log_every:      int   = 10         # steps
     eval_every:     int   = 1          # epochs
     save_every:     int   = 1          # epochs
