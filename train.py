@@ -11,6 +11,7 @@ Run:
 """
 
 import argparse
+import datetime
 import os
 import random
 from pathlib import Path
@@ -185,7 +186,8 @@ def main(cfg: Config):
     ddp = "LOCAL_RANK" in os.environ
     if ddp:
         local_rank = int(os.environ["LOCAL_RANK"])
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl",
+                                timeout=datetime.timedelta(hours=2))
         device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(device)
     else:
@@ -252,12 +254,25 @@ def main(cfg: Config):
     miner  = NegativeMiner(cfg, clip_model=raw_model.encoder.clip)
 
     # Training loop
-    best_acc = 0.0
-    run_dir  = CKPT_DIR / cfg.run_name
+    best_acc   = 0.0
+    start_epoch = 1
+    run_dir    = CKPT_DIR / cfg.run_name
     if is_main:
         run_dir.mkdir(parents=True, exist_ok=True)
 
-    for epoch in tqdm(range(1, cfg.train.epochs + 1), desc="Training", disable=not is_main):
+    if cfg.resume:
+        ckpt = torch.load(cfg.resume, map_location=device, weights_only=False)
+        raw_model.head.load_state_dict(ckpt["head_state"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = ckpt["epoch"] + 1
+        best_acc    = ckpt.get("metrics", {}).get("acc@0.5", 0.0)
+        for _ in range(ckpt["epoch"]):
+            scheduler.step()
+        if is_main:
+            print(f"Resumed from {cfg.resume} (epoch {ckpt['epoch']}, best acc {best_acc:.4f})")
+
+    for epoch in tqdm(range(start_epoch, cfg.train.epochs + 1), desc="Training", disable=not is_main):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         if is_main:
@@ -267,19 +282,24 @@ def main(cfg: Config):
         )
         scheduler.step()
 
-        if epoch % cfg.train.eval_every == 0 and is_main:
+        if epoch % cfg.train.eval_every == 0:
+            # All ranks evaluate — avoids rank 0 blocking others during a long eval window
             metrics = evaluate(raw_model, val_loader, evaluator, cfg)
-            acc = metrics["acc@0.5"]
-            print(f"  Val Acc@0.5: {acc:.4f}  |  mean IoU: {metrics['mean_iou']:.4f}")
-            print(f"  Breakdown: {metrics['acc_by_type']}")
+            if is_main:
+                acc = metrics["acc@0.5"]
+                print(f"  Val Acc@0.5: {acc:.4f}  |  mean IoU: {metrics['mean_iou']:.4f}")
+                print(f"  Breakdown: {metrics['acc_by_type']}")
 
-            if acc > best_acc:
+            if is_main and acc > best_acc:
                 best_acc = acc
                 raw_model.save(run_dir / "best.pt", epoch, optimizer, metrics)
                 print(f"  ** New best: {best_acc:.4f} — saved to {run_dir}/best.pt")
 
         if epoch % cfg.train.save_every == 0 and is_main:
             raw_model.save(run_dir / f"epoch_{epoch:03d}.pt", epoch)
+
+        if ddp:
+            dist.barrier()  # wait for rank 0 to finish eval/checkpoint before next epoch
 
     if ddp:
         dist.destroy_process_group()
@@ -302,6 +322,8 @@ if __name__ == "__main__":
                         help="random fraction of training data to use, e.g. 0.4")
     parser.add_argument("--skip_baseline", action="store_true",
                         help="skip CLIP baseline eval before training")
+    parser.add_argument("--resume", default=None,
+                        help="path to checkpoint to resume training from")
     args = parser.parse_args()
 
     cfg = DEFAULT_CONFIG
@@ -312,5 +334,6 @@ if __name__ == "__main__":
     if args.use_cache     is not None: cfg.data.use_cache     = args.use_cache
     if args.data_fraction is not None: cfg.data.data_fraction = args.data_fraction
     if args.skip_baseline: cfg.skip_baseline = args.skip_baseline
+    if args.resume:        cfg.resume        = args.resume
 
     main(cfg)

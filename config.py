@@ -28,7 +28,7 @@ This project uses TWO separate sources that must be combined:
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -140,9 +140,10 @@ class Config:
     data:  DataConfig  = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     eval:  EvalConfig  = field(default_factory=EvalConfig)
-    run_name:      str  = "baseline"
-    debug:         bool = False        # small dataset, fast iterations
-    skip_baseline: bool = False        # skip CLIP baseline eval before training
+    run_name:      str        = "baseline"
+    debug:         bool       = False        # small dataset, fast iterations
+    skip_baseline: bool       = False        # skip CLIP baseline eval before training
+    resume:        Optional[str] = None      # path to checkpoint to resume from
 
 
 # Convenience: one default config instance
