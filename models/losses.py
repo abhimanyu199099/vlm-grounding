@@ -18,6 +18,7 @@ Three losses:
       uniformly across all tokens.
 """
 
+import math
 from typing import Optional
 
 import torch
@@ -49,31 +50,25 @@ def grounding_loss(scores:       torch.Tensor,                   # (B, N)
     """
     B, N = scores.shape
     device = scores.device
+    pos_idx = pos_idx.clamp(0, N - 1)  # guard against edge cases
 
     if neg_indices is None:
         return F.cross_entropy(scores, pos_idx)
 
-    if not cross_image:
-        batch_idx  = torch.arange(B, device=device)
-        pos_scores = scores[batch_idx, pos_idx].unsqueeze(1)              # (B, 1)
-        neg_indices = neg_indices.clamp(0, N - 1)
-        neg_scores  = scores[
-            batch_idx.unsqueeze(1).expand_as(neg_indices),
-            neg_indices,
-        ]                                                                   # (B, K)
-        logits = torch.cat([pos_scores, neg_scores], dim=1)                # (B, 1+K)
-        labels = torch.zeros(B, dtype=torch.long, device=device)
-        return F.cross_entropy(logits, labels)
+    batch_idx  = torch.arange(B, device=device)
+    pos_scores = scores[batch_idx, pos_idx].unsqueeze(1)              # (B, 1)
 
-    # Mode C — cross-batch: map flat indices back to (image, proposal) pairs
-    neg_prop_idx = neg_indices % N                                          # (B, K)
-    batch_idx    = torch.arange(B, device=device)
-    pos_scores   = scores[batch_idx, pos_idx].unsqueeze(1)                 # (B, 1)
-    neg_scores   = scores[
-        batch_idx.unsqueeze(1).expand_as(neg_prop_idx),
-        neg_prop_idx.clamp(0, N - 1),
-    ]                                                                       # (B, K)
-    logits = torch.cat([pos_scores, neg_scores], dim=1)                    # (B, 1+K)
+    # cross_image=True means flat (B*N) indices — strip image info and treat as
+    # per-image proposal indices. Cross-image scores can't be read from the (B,N)
+    # scores matrix without re-running the head, so we score them against the
+    # current image; the CLIP-similarity-based selection still picks hard proposals.
+    neg_indices = neg_indices % N if cross_image else neg_indices
+    neg_indices = neg_indices.clamp(0, N - 1)
+    neg_scores  = scores[
+        batch_idx.unsqueeze(1).expand_as(neg_indices),
+        neg_indices,
+    ]                                                                   # (B, K)
+    logits = torch.cat([pos_scores, neg_scores], dim=1)                # (B, 1+K)
     labels = torch.zeros(B, dtype=torch.long, device=device)
     return F.cross_entropy(logits, labels)
 
@@ -104,9 +99,6 @@ def hard_negative_contrastive_loss(
     If fewer than k valid negatives exist for an item (e.g., only 1 region),
     the surplus logit slots are -inf → exp(-inf)=0, which is safe for CE.
     """
-    if k == 0:
-        return phrase_embeds.new_tensor(0.0)
-
     B, N, D = region_embeds.shape
     device  = phrase_embeds.device
 
@@ -124,14 +116,22 @@ def hard_negative_contrastive_loss(
     pos_one_hot.scatter_(1, pos_idx_.unsqueeze(1), True)
     neg_mask = proposal_mask & ~pos_one_hot                           # (B, N)
 
+    # Guard: if no valid negatives exist, return a graph-connected zero so DDP
+    # allreduces complete on all ranks (a detached constant breaks DDP sync).
+    if k == 0 or not neg_mask.any():
+        return (phrase_embeds.sum() + region_embeds.sum()) * 0.0
+
     # Set invalid / positive positions to -inf, then take top-k
-    sim_neg = sim.masked_fill(~neg_mask, float("-inf"))               # (B, N)
+    sim_neg  = sim.masked_fill(~neg_mask, float("-inf"))              # (B, N)
     actual_k = min(k, N - 1)
     topk_scores, _ = sim_neg.topk(actual_k, dim=1)                   # (B, k)
 
-    # Apply temperature and penalty factor to hard negatives
+    # Temperature-scale then apply penalty as additive logit offset.
+    # Multiplicative scaling on raw similarities is wrong because it changes
+    # the sign of negative similarities, making easy negatives even easier.
+    log_penalty = math.log(penalty_factor)
     pos_logit  = pos_scores / temperature                             # (B,)
-    neg_logits = topk_scores * penalty_factor / temperature           # (B, k)
+    neg_logits = topk_scores / temperature + log_penalty             # (B, k)
 
     # [pos | hard_negs] → (B, 1+k), label=0 (positive always first)
     all_logits = torch.cat([pos_logit.unsqueeze(1), neg_logits], dim=1)
@@ -162,6 +162,6 @@ def token_entropy_loss(
     """
     # Explicit zero-out for numerical safety
     w = token_weights * token_mask.float()                            # (B, L)
-    per_token = -w * torch.log(w + eps)                               # (B, L)
+    per_token = -w * torch.log(w.clamp(min=eps))                     # (B, L)
     seq_entropy = per_token.sum(dim=-1)                               # (B,)
     return seq_entropy.mean()                                         # scalar

@@ -9,11 +9,11 @@ Run:
     python train.py --run_name lora_r16 --model.lora_rank 16
     python train.py --debug   # fast smoke-test with 200 samples
 """
-
 import argparse
 import datetime
 import os
 import random
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -126,6 +126,7 @@ def evaluate(model, loader, evaluator, cfg):
             proposals=proposals,
             gt_boxes=gt_boxes,
             entity_types=entity_types,
+            scores=out["scores"].detach(),
         )
 
     return evaluator.compute()
@@ -247,28 +248,33 @@ def main(cfg: Config):
         lr=cfg.train.lr,
         weight_decay=cfg.train.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg.train.epochs
-    )
     scaler = GradScaler('cuda', enabled=cfg.train.mixed_precision)
     miner  = NegativeMiner(cfg, clip_model=raw_model.encoder.clip)
 
     # Training loop
-    best_acc   = 0.0
+    best_acc    = 0.0
     start_epoch = 1
-    run_dir    = CKPT_DIR / cfg.run_name
+    run_dir     = CKPT_DIR / cfg.run_name
     if is_main:
         run_dir.mkdir(parents=True, exist_ok=True)
 
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cfg.train.epochs
+        )
+
     if cfg.resume:
-        ckpt = torch.load(cfg.resume, map_location=device, weights_only=False)
-        raw_model.head.load_state_dict(ckpt["head_state"])
-        if "optimizer" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer"])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            ckpt = torch.load(cfg.resume, map_location=device, weights_only=False)
+            raw_model.head.load_state_dict(ckpt["head_state"])
+            if "optimizer" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer"])
+            if "scheduler" in ckpt:
+                scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt["epoch"] + 1
         best_acc    = ckpt.get("metrics", {}).get("acc@0.5", 0.0)
-        for _ in range(ckpt["epoch"]):
-            scheduler.step()
         if is_main:
             print(f"Resumed from {cfg.resume} (epoch {ckpt['epoch']}, best acc {best_acc:.4f})")
 
@@ -287,16 +293,15 @@ def main(cfg: Config):
             metrics = evaluate(raw_model, val_loader, evaluator, cfg)
             if is_main:
                 acc = metrics["acc@0.5"]
-                print(f"  Val Acc@0.5: {acc:.4f}  |  mean IoU: {metrics['mean_iou']:.4f}")
+                print(f"  Val Acc@0.5: {acc:.4f}  |  Recall@5: {metrics.get('recall@5', '?')}  |  mAP50: {metrics.get('mAP50', '?')}  |  mean IoU: {metrics['mean_iou']:.4f}")
                 print(f"  Breakdown: {metrics['acc_by_type']}")
-
-            if is_main and acc > best_acc:
-                best_acc = acc
-                raw_model.save(run_dir / "best.pt", epoch, optimizer, metrics)
-                print(f"  ** New best: {best_acc:.4f} — saved to {run_dir}/best.pt")
+                if acc > best_acc:
+                    best_acc = acc
+                    raw_model.save(run_dir / "best.pt", epoch, optimizer, scheduler, metrics)
+                    print(f"  ** New best: {best_acc:.4f} — saved to {run_dir}/best.pt")
 
         if epoch % cfg.train.save_every == 0 and is_main:
-            raw_model.save(run_dir / f"epoch_{epoch:03d}.pt", epoch)
+            raw_model.save(run_dir / f"epoch_{epoch:03d}.pt", epoch, scheduler=scheduler)
 
         if ddp:
             dist.barrier()  # wait for rank 0 to finish eval/checkpoint before next epoch

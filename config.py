@@ -41,7 +41,7 @@ ROOT     = Path(__file__).parent
 HF_DATASET_NAME = "nlphuji/flickr30k"
 
 # Flickr30k Entities XML annotations (manual download — see docstring above)
-ENTITIES_ANNO_DIR = ROOT / "flickr30k_entities" / "Annotations"
+ENTITIES_ANNO_DIR = ROOT / "flickr30k_entities" / "annotations" /"Annotations"
 
 # Cache: pre-computed proposals and region embeddings (large, gitignored)
 CACHE_DIR = ROOT / "cache"
@@ -87,13 +87,13 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    max_proposals:      int   = 20     # max region proposals per image
+    max_proposals:      int   = 30     # max region proposals per image
     proposal_method:    Literal["selective_search", "grid"] = "grid"
     neg_strategy:       Literal["inbatch", "clip_mined", "cross_image", "all"] = "inbatch"
     clip_mine_topk:     int   = 5      # how many hard negatives to mine per phrase via CLIP
     cross_image_pool:   int   = 50     # images to sample cross-image negatives from
     image_size:         int   = 224
-    num_workers:        int   = 0
+    num_workers:        int   = 1
     pin_memory:         bool  = True
     use_cache:          bool  = True  # load precomputed CLIP embeddings from CACHE_DIR if available
     data_fraction:      float = 1.0   # random subset of training data (1.0 = full dataset)
@@ -106,12 +106,12 @@ class DataConfig:
 @dataclass
 class TrainConfig:
     batch_size:     int   = 16
-    epochs:         int   = 5
-    lr:             float = 1e-4
+    epochs:         int   = 10
+    lr:             float = 2.5e-3
     weight_decay:   float = 1e-2
     warmup_steps:   int   = 500
     grad_clip:      float = 1.0
-    log_every:      int   = 50         # steps
+    log_every:      int   = 10         # steps
     eval_every:     int   = 1          # epochs
     save_every:     int   = 1          # epochs
     device:         str   = "cuda"     # "cpu" for debugging
@@ -125,7 +125,7 @@ class TrainConfig:
 
 @dataclass
 class EvalConfig:
-    iou_threshold:  float = 0.5        # Acc@0.5 threshold
+    iou_threshold:  float = 0.25        # Acc@0.25 threshold
     max_preds:      int   = 1          # top-1 prediction per phrase
     split:          str   = "val"      # "val" or "test"
 

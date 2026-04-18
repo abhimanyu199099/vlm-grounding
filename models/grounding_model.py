@@ -131,9 +131,11 @@ class GroundingModel(nn.Module):
         g_loss = grounding_loss(scores, pos_idx, neg_indices, cross_image)
 
         # ---- Loss 2: hard-negative contrastive loss ----
-        # Use the weighted query as the phrase embedding; normalise both sides.
-        phrase_q      = F.normalize(query, dim=-1)                  # (B, D)
-        region_norm   = F.normalize(region_embeds, dim=-1)          # (B, N, D)
+        # Use the frozen CLIP phrase embedding (already L2-normalised) so the
+        # contrastive loss does not conflict with the grounding head's own scorer.
+        # region_embeds are already L2-normalised from encode_region().
+        phrase_q      = F.normalize(phrase_embeds, dim=-1)          # (B, D)
+        region_norm   = region_embeds                               # (B, N, D) already normed
         cfg_m         = self.cfg.model
         c_loss = hard_negative_contrastive_loss(
             phrase_embeds=phrase_q,
@@ -175,12 +177,7 @@ class GroundingModel(nn.Module):
     # ------------------------------------------------------------------
 
     def save(self, path: Path, epoch: int,
-             optimizer=None, metrics: dict = None):
-        """
-        Save only the trainable head weights.
-        The encoder is frozen and always re-loaded from HuggingFace,
-        so saving it would double checkpoint size for no benefit.
-        """
+             optimizer=None, scheduler=None, metrics: dict = None):
         ckpt = {
             "epoch":      epoch,
             "head_state": self.head.state_dict(),
@@ -189,6 +186,8 @@ class GroundingModel(nn.Module):
         }
         if optimizer is not None:
             ckpt["optimizer"] = optimizer.state_dict()
+        if scheduler is not None:
+            ckpt["scheduler"] = scheduler.state_dict()
         torch.save(ckpt, path)
         return ckpt
 
@@ -197,7 +196,7 @@ class GroundingModel(nn.Module):
         Load head weights from a checkpoint.
         Returns the full checkpoint dict (caller can inspect epoch, metrics, etc.).
         """
-        ckpt = torch.load(path, map_location="cpu")
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
         # strict=True by default — will error if architecture changed
         self.head.load_state_dict(ckpt["head_state"], strict=True)
         if optimizer is not None and "optimizer" in ckpt:
