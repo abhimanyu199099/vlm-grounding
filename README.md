@@ -24,7 +24,7 @@ Images are loaded automatically from HuggingFace. You only need to download the 
 git clone https://github.com/BryanPlummer/flickr30k_entities
 ```
 
-The cloned repo must be placed (or already exist) at `flickr30k_entities/` in the project root. The relevant files inside are `annotations/Annotations/` (XML bounding boxes), `annotations/Sentences/` (phrase text), and `train.txt` / `val.txt` / `test.txt` (split lists).
+Place the cloned repo at `flickr30k_entities/` in the project root. The XML bounding box annotations must be at `flickr30k_entities/Annotations/`.
 
 ---
 
@@ -36,16 +36,51 @@ The cloned repo must be placed (or already exist) at `flickr30k_entities/` in th
 python train.py --debug
 ```
 
-**Full training run:**
+**Single-GPU training:**
 
 ```bash
 python train.py --run_name my_run
 ```
 
+**Multi-GPU training (DDP):**
+
+```bash
+torchrun --nproc_per_node=4 train.py --run_name my_run
+```
+
+**Training without precomputed cache:**
+
+```bash
+torchrun --nproc_per_node=4 train.py --run_name my_run --no_cache
+```
+
+**Pre-compute CLIP embeddings** (strongly recommended before training — skips the frozen CLIP forward pass each step):
+
+```bash
+python precompute.py                        # train + val splits (default)
+python precompute.py --split val            # val only
+```
+
 **Evaluate a saved checkpoint:**
 
 ```bash
-python evaluate.py --checkpoint checkpoints/my_run/best.pt
+python evaluate.py --ckpt checkpoints/my_run/best.pt --split val
+python evaluate.py --ckpt checkpoints/my_run/best.pt --split test --visualize 20
+```
+
+**Run ablations:**
+
+```bash
+python ablate.py --quick             # subset grid, faster overnight run
+python ablate.py                     # full grid
+python ablate.py --eval_refcoco      # + zero-shot RefCOCO+ testA/testB eval after each run
+python ablate.py --dry_run           # preview commands without training
+```
+
+**Evaluate a single checkpoint zero-shot on RefCOCO+ testA/testB:**
+
+```bash
+python ablate.py --ckpt checkpoints/my_run/best.pt
 ```
 
 **Interactive demo:**
@@ -54,7 +89,21 @@ python evaluate.py --checkpoint checkpoints/my_run/best.pt
 python demo/app.py
 ```
 
-Config defaults (batch size, learning rate, model depth, etc.) are in `config.py`.
+---
+
+## Key CLI arguments (`train.py`)
+
+| Argument | Default | Description |
+|---|---|---|
+| `--run_name` | `baseline` | Experiment name; checkpoint saved to `checkpoints/<run_name>/` |
+| `--debug` | off | Use 200 samples for a fast smoke-test |
+| `--use_cache` / `--no_cache` | cache on | Toggle precomputed CLIP embedding loading |
+| `--data_fraction` | `1.0` | Random subset of training data, e.g. `0.3` |
+| `--skip_baseline` | off | Skip the frozen-CLIP baseline eval before training |
+| `--lora_rank` | `8` | LoRA rank for the grounding head; `0` disables LoRA |
+| `--head_depth` | `1` | Number of cross-attention layers in the grounding head |
+
+Config defaults (batch size, learning rate, proposal method, etc.) live in `config.py`.
 
 ---
 
@@ -66,9 +115,9 @@ CLIP (ViT-B/32) is kept fully frozen. A small grounding head (~1.9M parameters) 
 2. Each region proposal (image crop) is encoded into an embedding by CLIP's vision transformer
 3. A cross-attention layer lets phrase tokens attend over region embeddings
 4. A token-weighting MLP learns which words matter most and produces a weighted phrase embedding
-5. The phrase embedding is scored against each region; the highest-scoring region is the prediction
+5. The weighted phrase embedding is scored against each region; the highest-scoring region is the prediction
 
-Training uses three losses: cross-entropy over proposals, a hard-negative contrastive loss (InfoNCE), and a token entropy regulariser that encourages the model to focus on content words.
+Training uses three losses: cross-entropy over proposals, a hard-negative contrastive loss (InfoNCE), and a token entropy regulariser that encourages the model to focus on content words rather than function words.
 
 See [PROJECT.md](PROJECT.md) for a detailed architecture description.
 
@@ -90,24 +139,27 @@ Evaluated on Flickr30k Entities validation set, primary metric **Acc@0.5** (pred
 ```
 vlm_grounding/
 ├── config.py                  # All paths and hyperparameters
-├── train.py                   # Training loop
-├── evaluate.py                # Standalone evaluation
+├── train.py                   # Training loop (single-GPU and 4-GPU DDP)
+├── precompute.py              # Pre-compute and cache CLIP embeddings per split
+├── evaluate.py                # Standalone checkpoint evaluation
+├── ablate.py                  # Ablation grid search + RefCOCO+ zero-shot eval
 ├── models/
-│   ├── encoder.py             # Frozen CLIP wrapper
+│   ├── encoder.py             # Frozen CLIP wrapper (text + vision)
 │   ├── head.py                # Cross-attention grounding head
 │   ├── losses.py              # Grounding, contrastive, and entropy losses
-│   └── grounding_model.py     # Top-level model
+│   └── grounding_model.py     # Top-level model; owns loss + checkpointing
 ├── data/
 │   ├── dataset.py             # Flickr30k Entities dataset + proposal generation
-│   └── negatives.py           # Online hard negative mining
+│   ├── refcoco.py             # RefCOCO+ dataset for zero-shot evaluation
+│   └── negatives.py           # Online hard-negative mining
 ├── eval/
-│   ├── metrics.py             # Acc@0.5, mean IoU, per-type breakdown
+│   ├── metrics.py             # Acc@0.5, mean IoU, per-entity-type breakdown
 │   └── visualize.py           # Prediction visualisation
 ├── demo/
 │   ├── app.py                 # Gradio web demo
 │   └── inference.py           # Single-image inference helper
 ├── flickr30k_entities/        # Cloned annotation repo (not committed)
-├── cache/                     # Cached region proposals (not committed)
+├── cache/                     # Cached proposals + CLIP embeddings (not committed)
 └── checkpoints/               # Saved model weights (not committed)
 ```
 
@@ -115,8 +167,8 @@ vlm_grounding/
 
 ## Requirements
 
-- Python 3.9+
-- PyTorch 2.0+
-- `transformers`, `datasets`, `torchvision`, `Pillow`
-- `opencv-contrib-python` for selective search proposals (optional — falls back to a multi-scale grid)
+- Python 3.8+
+- PyTorch 2.4+
+- `transformers`, `datasets`, `torchvision`, `Pillow`, `tqdm`
+- `opencv-contrib-python` for selective search proposals (optional — falls back to multi-scale grid)
 - `gradio` for the demo

@@ -164,12 +164,10 @@ def precompute_phrase_embeds(encoder: FrozenCLIPEncoder,
 
         text_hidden   = encoder.encode_text(input_ids, attn_mask).cpu().half()    # (B, 77, D_text)
         phrase_embeds = encoder.encode_phrase(input_ids, attn_mask).cpu().half()  # (B, D_proj)
-        seq_lens      = attn_mask.sum(dim=1).cpu()                                # (B,) real token counts
 
         for i, (img_id, phrase_id, _) in enumerate(batch_items):
-            L = int(seq_lens[i])
             results[(img_id, phrase_id)] = {
-                "text_hidden":  text_hidden[i, :L],   # (L, D_text) — padding stripped
+                "text_hidden":  text_hidden[i],
                 "phrase_embed": phrase_embeds[i],
             }
 
@@ -213,6 +211,7 @@ def main():
 
     for split in args.split:
         print(f"\n=== {split} ===")
+        cfg.data.use_cache = False   # always load raw crops; we are building the cache
         dataset = Flickr30kGroundingDataset(cfg, split=split, tokenizer=tokenizer)
         precompute_region_embeds(encoder, dataset, method, device,
                                  batch_size=args.region_batch_size,

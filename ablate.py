@@ -19,13 +19,19 @@ ABLATION GRID (edit as needed):
 """
 
 import itertools
-import json
 import subprocess
 import sys
-from copy import deepcopy
 from pathlib import Path
 
+import torch
+from torch.utils.data import DataLoader
+from transformers import CLIPTokenizer
+
 from config import DEFAULT_CONFIG, CKPT_DIR
+from data.refcoco import RefCOCOPlusDataset
+from data.dataset import collate_fn
+from eval import GroundingEvaluator
+from models import GroundingModel
 
 
 ABLATION_GRID = {
@@ -55,6 +61,50 @@ def run_config(run_name: str, overrides: dict, dry_run: bool = False):
         subprocess.run(cmd, check=True)
 
 
+@torch.no_grad()
+def eval_refcoco_plus(ckpt_path: Path, cfg=None) -> dict:
+    """
+    Load a checkpoint and evaluate zero-shot on RefCOCO+ testA and testB.
+    Returns {"testA": metrics_dict, "testB": metrics_dict}.
+    """
+    if cfg is None:
+        cfg = DEFAULT_CONFIG
+
+    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = CLIPTokenizer.from_pretrained(cfg.model.clip_model)
+    model     = GroundingModel(cfg).to(device)
+
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    evaluator = GroundingEvaluator(cfg)
+    results   = {}
+
+    for split in ("testA", "testB"):
+        ds     = RefCOCOPlusDataset(cfg, split=split, tokenizer=tokenizer)
+        loader = DataLoader(ds, batch_size=cfg.train.batch_size, shuffle=False,
+                            collate_fn=collate_fn, num_workers=cfg.data.num_workers)
+        evaluator.reset()
+
+        for batch in loader:
+            out   = model(batch, neg_mining=None)
+            preds = out["preds"]
+            evaluator.update_from_indices(
+                pred_idx=preds,
+                proposals=batch["proposals"],
+                gt_boxes=batch["gt_box"],
+                entity_types=batch["entity_type"],
+            )
+
+        results[split] = evaluator.compute()
+        print(f"  RefCOCO+ {split}: "
+              f"Acc@0.5={results[split]['acc@0.5']:.4f}  "
+              f"mIoU={results[split]['mean_iou']:.4f}")
+
+    return results
+
+
 def collect_results() -> list:
     """Read best.pt checkpoints and extract metrics for comparison."""
     results = []
@@ -70,7 +120,7 @@ def collect_results() -> list:
     return results
 
 
-def main(quick: bool = False, dry_run: bool = False):
+def main(quick: bool = False, dry_run: bool = False, eval_refcoco: bool = False):
     grid = QUICK_GRID if quick else ABLATION_GRID
 
     keys   = list(grid.keys())
@@ -84,8 +134,14 @@ def main(quick: bool = False, dry_run: bool = False):
                                         for k, v in overrides.items())
         run_config(run_name, overrides, dry_run=dry_run)
 
+        if eval_refcoco and not dry_run:
+            ckpt_path = CKPT_DIR / run_name / "best.pt"
+            if ckpt_path.exists():
+                print(f"\n--- RefCOCO+ zero-shot eval: {run_name} ---")
+                eval_refcoco_plus(ckpt_path)
+
     if not dry_run:
-        print("\n\n=== Ablation results (sorted by Acc@0.5) ===")
+        print("\n\n=== Ablation results — Flickr30k val (sorted by Acc@0.5) ===")
         for r in collect_results():
             m = r["metrics"]
             print(f"  {r['run']:60s}  "
@@ -96,7 +152,16 @@ def main(quick: bool = False, dry_run: bool = False):
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--quick",   action="store_true")
-    p.add_argument("--dry_run", action="store_true")
+    p.add_argument("--quick",        action="store_true")
+    p.add_argument("--dry_run",      action="store_true")
+    p.add_argument("--eval_refcoco", action="store_true",
+                   help="evaluate each ablation checkpoint zero-shot on RefCOCO+ testA/testB")
+    p.add_argument("--ckpt",         default=None,
+                   help="evaluate a single checkpoint on RefCOCO+ (skips ablation grid)")
     args = p.parse_args()
-    main(quick=args.quick, dry_run=args.dry_run)
+
+    if args.ckpt:
+        print(f"=== RefCOCO+ zero-shot eval: {args.ckpt} ===")
+        eval_refcoco_plus(Path(args.ckpt))
+    else:
+        main(quick=args.quick, dry_run=args.dry_run, eval_refcoco=args.eval_refcoco)
