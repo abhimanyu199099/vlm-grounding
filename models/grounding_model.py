@@ -90,23 +90,28 @@ class GroundingModel(nn.Module):
         """
         device = next(self.head.parameters()).device
 
-        phrase_tokens = batch["phrase_tokens"].to(device)         # (B, 77)
-        pos_idx       = batch["pos_idx"].to(device)               # (B,)
+        phrase_tokens = batch["phrase_tokens"].to(device, non_blocking=True)   # (B, 77)
+        pos_idx       = batch["pos_idx"].to(device, non_blocking=True)         # (B,)
 
         proposal_mask = batch.get("proposal_mask")
         if proposal_mask is not None:
-            proposal_mask = proposal_mask.to(device)              # (B, N) bool
+            proposal_mask = proposal_mask.to(device, non_blocking=True)        # (B, N) bool
 
-        # Attention mask: 1 for real tokens, 0 for padding (CLIP pads with 0)
-        attn_mask = (phrase_tokens != 0).to(device)               # (B, 77)
+        proposals = batch.get("proposals")
+        if proposals is not None:
+            proposals = proposals.to(device, non_blocking=True)                # (B, N, 4)
+
+        # Use tokenizer's attention_mask directly — pad_token_id=49407 (not 0),
+        # so (phrase_tokens != 0) would incorrectly mark all positions as real.
+        attn_mask = batch["phrase_attn_mask"].to(device, non_blocking=True)    # (B, 77)
 
         # ---- Encode — skip if pre-computed embeddings are in the batch ----
         if "text_hidden" in batch and "region_embeds" in batch:
-            text_hidden   = batch["text_hidden"].to(device)       # (B, L, D_text)
-            region_embeds = batch["region_embeds"].to(device)     # (B, N, D_proj)
-            phrase_embeds = batch["phrase_embed"].to(device)      # (B, D_proj)
+            text_hidden   = batch["text_hidden"].to(device, non_blocking=True)    # (B, L, D_text)
+            region_embeds = batch["region_embeds"].to(device, non_blocking=True)  # (B, N, D_proj)
+            phrase_embeds = batch["phrase_embed"].to(device, non_blocking=True)   # (B, D_proj)
         else:
-            proposal_crops = batch["proposal_crops"].to(device)   # (B, N, 3, H, W)
+            proposal_crops = batch["proposal_crops"].to(device, non_blocking=True)  # (B, N, 3, H, W)
             text_hidden    = self.encoder.encode_text(phrase_tokens, attn_mask)
             region_embeds  = self.encoder.encode_region(proposal_crops)
             phrase_embeds  = self.encoder.encode_phrase(phrase_tokens, attn_mask)
@@ -118,7 +123,8 @@ class GroundingModel(nn.Module):
             region_embeds=region_embeds,
             text_mask=attn_mask,
             proposal_mask=proposal_mask,
-        )                                                           # (B,N), (B,L), (B,D)
+            proposals=proposals,
+        )                                                           # (B,N), (B,L), (B,d)
 
         # ---- Loss 1: grounding loss (CE over proposals) ----
         neg_indices = None
@@ -131,11 +137,14 @@ class GroundingModel(nn.Module):
         g_loss = grounding_loss(scores, pos_idx, neg_indices, cross_image)
 
         # ---- Loss 2: hard-negative contrastive loss ----
-        # Use the frozen CLIP phrase embedding (already L2-normalised) so the
-        # contrastive loss does not conflict with the grounding head's own scorer.
+        # Use the head's query (learned weighted-text projection, dim=proj_dim) so that
+        # the contrastive loss actually trains the head's parameters.
         # region_embeds are already L2-normalised from encode_region().
-        phrase_q      = F.normalize(phrase_embeds, dim=-1)          # (B, D)
-        region_norm   = region_embeds                               # (B, N, D) already normed
+        phrase_q    = F.normalize(query.float(), dim=-1).to(query.dtype)
+        phrase_q    = torch.nan_to_num(phrase_q, nan=0.0)
+        rp          = self.head.region_proj(region_embeds)
+        region_norm = F.normalize(rp.float(), dim=-1).to(rp.dtype)
+        region_norm = torch.nan_to_num(region_norm, nan=0.0)
         cfg_m         = self.cfg.model
         c_loss = hard_negative_contrastive_loss(
             phrase_embeds=phrase_q,
@@ -149,7 +158,9 @@ class GroundingModel(nn.Module):
         )
 
         # ---- Loss 3: token entropy regularisation ----
-        e_loss = token_entropy_loss(token_weights, attn_mask.bool())
+        e_loss = token_entropy_loss(
+            token_weights, attn_mask.bool(), target=cfg_m.entropy_target
+        )
 
         # ---- Combine ----
         total = (

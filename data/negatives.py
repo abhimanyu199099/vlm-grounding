@@ -63,7 +63,7 @@ class NegativeMiner:
                                  the loss should gather them from the flattened bank
         """
         if self.strategy == "inbatch":
-            return self._inbatch(batch, phrase_embeds, region_embeds), True
+            return self._inbatch(batch, phrase_embeds, region_embeds), False
         elif self.strategy == "clip_mined":
             return self._clip_mined(phrase_embeds, region_embeds,
                                     batch["pos_idx"],
@@ -95,49 +95,65 @@ class NegativeMiner:
                  region_embeds: torch.Tensor,   # (B, N, D)
                  ) -> torch.Tensor:
         """
-        For each phrase i, find the K most similar proposals from all *other*
-        images in the batch. These are hard because CLIP already considers them
-        plausible matches, yet they belong to different images.
+        For each phrase i, find the K hardest cross-image negatives and map
+        them back to per-image proposal indices so grounding_loss can use them
+        directly from the (B, N) scores tensor.
 
         Steps:
-          1. Flatten all proposals to a (B*N, D) bank.
-          2. Compute (B, B*N) cosine similarity matrix.
-          3. Mask out the B*N positions that belong to phrase i's own image
-             (indices [i*N .. i*N+N-1]) — they could be true positives.
-          4. Also mask padding proposals via proposal_mask.
-          5. Return top-K indices per row from the remaining positions.
+          1. Compute (B, B) phrase-to-phrase similarity to find the K other
+             images whose phrases are most similar to phrase i (hardest distractors).
+          2. For each selected image j, find which of image i's own proposals
+             most resembles image j's GT region embedding. That proposal is a
+             valid hard negative: it looks like the object being described in
+             image j, so the grounding head must learn to reject it for phrase i.
+          3. Exclude image i's own GT proposal from consideration.
 
-        Returns: (B, K) — flat indices into the (B*N,) bank.
+        Returns: (B, K) — per-image proposal indices, cross_image=False.
         """
         K = self.cfg.data.clip_mine_topk
-        B, N, D = region_embeds.shape
+        B, N, _ = region_embeds.shape
         device   = region_embeds.device
 
-        # (B*N, D) flat bank of all region embeddings
-        flat_regions = region_embeds.view(B * N, D)               # (B*N, D)
+        pos_idx = batch["pos_idx"].to(device)                      # (B,)
+        proposal_mask = batch.get("proposal_mask")
+        if proposal_mask is not None:
+            proposal_mask = proposal_mask.to(device)               # (B, N)
 
-        # (B, B*N) similarity — phrase_embeds already L2-normed, flat_regions too
-        sim = torch.mm(phrase_embeds, flat_regions.t())           # (B, B*N)
+        # GT region embedding for each image: (B, D)
+        batch_idx  = torch.arange(B, device=device)
+        gt_regions = region_embeds[batch_idx, pos_idx.clamp(0, N - 1)]  # (B, D)
 
-        # Build mask: True = valid negative (from a different image, not padding)
-        valid = torch.ones(B, B * N, dtype=torch.bool, device=device)
+        # (B, B) phrase similarity — find hardest cross-image distractors
+        phrase_sim = torch.mm(phrase_embeds, phrase_embeds.t())    # (B, B)
+        phrase_sim.fill_diagonal_(float("-inf"))                   # exclude self
 
-        # Mask own-image proposals
-        for i in range(B):
-            valid[i, i * N : i * N + N] = False
+        K_peers = min(K, B - 1)
+        top_peer_idx = phrase_sim.topk(K_peers, dim=1).indices     # (B, K_peers)
 
-        # Mask padding proposals across the whole bank
-        if "proposal_mask" in batch and batch["proposal_mask"] is not None:
-            # proposal_mask: (B, N) Bool — True = real proposal
-            flat_mask = batch["proposal_mask"].to(device).view(B * N)  # (B*N,)
-            valid &= flat_mask.unsqueeze(0)                        # (B, B*N)
+        # Vectorised: for each (i, slot) pair find which of image i's proposals
+        # most resembles image top_peer_idx[i, slot]'s GT region — no Python loops.
+        peer_gt = gt_regions[top_peer_idx]                         # (B, K_peers, D)
 
-        # Set invalid positions to -inf before top-K
-        sim = sim.masked_fill(~valid, float("-inf"))
+        # Similarity of every proposal of i against every peer GT of i: (B, N, K_peers)
+        sim_all = torch.einsum("bnd,bkd->bnk", region_embeds, peer_gt)
 
-        K = min(K, B * N - N)  # at most all cross-image proposals
-        K = max(K, 1)
-        neg_indices = sim.topk(K, dim=1).indices                  # (B, K)
+        # Mask own GT proposal for each image
+        own_gt_mask = torch.zeros(B, N, dtype=torch.bool, device=device)
+        own_gt_mask[batch_idx, pos_idx.clamp(0, N - 1)] = True
+        sim_all = sim_all.masked_fill(own_gt_mask.unsqueeze(-1), float("-inf"))
+
+        # Mask padding proposals
+        if proposal_mask is not None:
+            sim_all = sim_all.masked_fill(~proposal_mask.unsqueeze(-1), float("-inf"))
+
+        # Best proposal per (image, peer) pair → (B, K_peers)
+        neg_indices = sim_all.permute(0, 2, 1).argmax(dim=-1)     # (B, K_peers)
+
+        # Pad to K if K_peers < K (remaining slots stay 0, which is safe)
+        if K_peers < K:
+            pad = torch.zeros(B, K - K_peers, dtype=torch.long, device=device)
+            neg_indices = torch.cat([neg_indices, pad], dim=1)
+
         return neg_indices
 
     # -----------------------------------------------------------------------
@@ -176,7 +192,7 @@ class NegativeMiner:
 
         # Mask padding proposals
         if proposal_mask is not None:
-            sim = sim.masked_fill(~proposal_mask, float("-inf"))
+            sim = sim.masked_fill(~proposal_mask.to(device), float("-inf"))
 
         K = min(K, N - 1)
         K = max(K, 1)
@@ -242,7 +258,7 @@ class NegativeMiner:
                 sim_i  = torch.einsum("d,nd->n", phrase_embeds[i], region_embeds[i])
                 sim_i[pos_idx[i].clamp(0, N - 1)] = float("-inf")
                 if batch.get("proposal_mask") is not None:
-                    sim_i = sim_i.masked_fill(~batch["proposal_mask"][i], float("-inf"))
+                    sim_i = sim_i.masked_fill(~batch["proposal_mask"][i].to(device), float("-inf"))
                 k_i = min(K, N - 1)
                 neg_indices[i, :k_i] = sim_i.topk(k_i).indices
                 continue
@@ -266,7 +282,7 @@ class NegativeMiner:
                 # Exclude item i's own GT proposal
                 sim_ij[pos_idx[i].clamp(0, N - 1)] = float("-inf")
                 if batch.get("proposal_mask") is not None:
-                    sim_ij = sim_ij.masked_fill(~batch["proposal_mask"][i], float("-inf"))
+                    sim_ij = sim_ij.masked_fill(~batch["proposal_mask"][i].to(device), float("-inf"))
                 neg_indices[i, slot] = sim_ij.argmax()
 
             # If k_peers < K, fill remaining slots with clip_mined fallback
@@ -274,7 +290,7 @@ class NegativeMiner:
                 sim_i = torch.einsum("d,nd->n", phrase_embeds[i], region_embeds[i])
                 sim_i[pos_idx[i].clamp(0, N - 1)] = float("-inf")
                 if batch.get("proposal_mask") is not None:
-                    sim_i = sim_i.masked_fill(~batch["proposal_mask"][i], float("-inf"))
+                    sim_i = sim_i.masked_fill(~batch["proposal_mask"][i].to(device), float("-inf"))
                 # Zero out slots already filled by cross-image to avoid re-selecting them
                 for slot in range(k_peers):
                     sim_i[neg_indices[i, slot]] = float("-inf")

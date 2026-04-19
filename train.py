@@ -10,6 +10,7 @@ Run:
     python train.py --debug   # fast smoke-test with 200 samples
 """
 import argparse
+import math
 import datetime
 import os
 import random
@@ -49,7 +50,7 @@ def set_seed(seed: int):
 # Training step
 # ---------------------------------------------------------------------------
 
-def train_one_epoch(model, raw_model, loader, optimizer, scaler, miner, evaluator, cfg, epoch):
+def train_one_epoch(model, raw_model, loader, optimizer, scaler, scheduler, miner, evaluator, cfg, epoch):
     model.train()
     total_loss       = 0.0
     total_g_loss     = 0.0
@@ -57,28 +58,36 @@ def train_one_epoch(model, raw_model, loader, optimizer, scaler, miner, evaluato
     total_e_loss     = 0.0
 
     is_main = int(os.environ.get("LOCAL_RANK", 0)) == 0
+    device  = next(raw_model.parameters()).device
     pbar = tqdm(loader, desc=f"Epoch {epoch}", disable=not is_main, leave=True)
 
     for step, batch in enumerate(pbar):
         optimizer.zero_grad()
 
+        # Mine hard negatives using frozen CLIP embeddings — no head needed,
+        # so run outside autocast with no_grad to avoid wasting compute.
+        neg_mining = None
+        if miner is not None:
+            with torch.no_grad():
+                phrase_tokens = batch["phrase_tokens"].to(device, non_blocking=True)
+                attn_mask     = batch["phrase_attn_mask"].to(device, non_blocking=True)
+                if "phrase_embed" in batch and "region_embeds" in batch:
+                    phrase_embeds = batch["phrase_embed"].to(device, non_blocking=True)
+                    region_embeds = batch["region_embeds"].to(device, non_blocking=True)
+                else:
+                    proposal_crops = batch["proposal_crops"].to(device, non_blocking=True)
+                    phrase_embeds  = raw_model.encoder.encode_phrase(phrase_tokens, attn_mask)
+                    region_embeds  = raw_model.encoder.encode_region(proposal_crops)
+            neg_indices, cross_image = miner.mine(batch, phrase_embeds, region_embeds)
+            neg_mining = (neg_indices, cross_image)
+
         with autocast('cuda', enabled=cfg.train.mixed_precision):
-            # First forward pass without hard negatives to get embeddings
-            out = model(batch, neg_mining=None)
-
-            # Mine hard negatives using the embeddings from this forward pass
-            neg_mining = None
-            if miner is not None:
-                neg_indices, cross_image = miner.mine(
-                    batch,
-                    phrase_embeds=out["phrase_embeds"].detach(),
-                    region_embeds=out["region_embeds"].detach(),
-                )
-                neg_mining = (neg_indices, cross_image)
-                # Re-score with hard negatives informing the loss
-                out = model(batch, neg_mining=neg_mining)
-
+            out  = model(batch, neg_mining=neg_mining)
             loss = out["loss"]
+
+        if not torch.isfinite(loss):
+            optimizer.zero_grad()
+            continue
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -87,6 +96,7 @@ def train_one_epoch(model, raw_model, loader, optimizer, scaler, miner, evaluato
         )
         scaler.step(optimizer)
         scaler.update()
+        scheduler.step()
 
         total_loss   += loss.item()
         total_g_loss += out["grounding_loss"].item()
@@ -94,6 +104,14 @@ def train_one_epoch(model, raw_model, loader, optimizer, scaler, miner, evaluato
         total_e_loss += out["entropy_loss"].item()
 
         if step % cfg.train.log_every == 0:
+            tw = out["token_weights"]
+            entropy = -(tw * torch.log(tw.clamp(1e-8))).sum(-1).mean().item()
+            grad_norm = sum(p.grad.norm().item() for p in raw_model.head.parameters() if p.grad is not None)
+            log_temp  = raw_model.head.log_temp.item()
+            pos_idx_b = batch["pos_idx"]
+            print(f"entropy={entropy:.3f}  grad_norm={grad_norm:.4f}  log_temp={log_temp:.3f}  "
+                  f"lr={scheduler.get_last_lr()[0]:.2e}  "
+                  f"pos_idx_mean={pos_idx_b.float().mean():.1f}  pos_idx_max={pos_idx_b.max().item()}")
             n = step + 1
             pbar.set_postfix({
                 "loss":        f"{total_loss   / n:.4f}",
@@ -144,26 +162,24 @@ def clip_baseline(model, loader, evaluator, cfg):
     """
     model.eval()
     evaluator.reset()
+    device = next(model.parameters()).device
 
     for batch in loader:
-        device = next(model.parameters()).device
-        phrase_tokens = batch["phrase_tokens"].to(device)
-        attn_mask     = (phrase_tokens != 0).to(device)
+        phrase_tokens = batch["phrase_tokens"].to(device, non_blocking=True)
+        attn_mask     = batch["phrase_attn_mask"].to(device, non_blocking=True)
 
         if "region_embeds" in batch:
-            # Pre-computed embeddings available — skip encoder forward pass
-            region_embeds = batch["region_embeds"].to(device)   # (B, N, D)
-            phrase_embeds = batch["phrase_embed"].to(device)     # (B, D)
+            region_embeds = batch["region_embeds"].to(device, non_blocking=True)  # (B, N, D)
+            phrase_embeds = batch["phrase_embed"].to(device, non_blocking=True)   # (B, D)
         else:
-            proposal_crops = batch["proposal_crops"].to(device)
-            phrase_embeds = model.encoder.encode_phrase(phrase_tokens, attn_mask)  # (B, D)
-            region_embeds = model.encoder.encode_region(proposal_crops)            # (B, N, D)
+            proposal_crops = batch["proposal_crops"].to(device, non_blocking=True)
+            phrase_embeds = model.encoder.encode_phrase(phrase_tokens, attn_mask)
+            region_embeds = model.encoder.encode_region(proposal_crops)
 
-        # Cosine similarity: (B, N)
         scores = torch.einsum("bd,bnd->bn", phrase_embeds, region_embeds)
 
         if "proposal_mask" in batch:
-            mask = batch["proposal_mask"].to(device)
+            mask = batch["proposal_mask"].to(device, non_blocking=True)
             scores = scores.masked_fill(~mask, float("-inf"))
 
         preds = scores.argmax(dim=1)
@@ -218,6 +234,7 @@ def main(cfg: Config):
     val_loader    = DataLoader(val_ds,   batch_size=cfg.train.batch_size,
                                shuffle=False, collate_fn=collate_fn,
                                num_workers=cfg.data.num_workers,
+                               pin_memory=cfg.data.pin_memory,
                                persistent_workers=persistent)
 
     # Model
@@ -258,11 +275,15 @@ def main(cfg: Config):
     if is_main:
         run_dir.mkdir(parents=True, exist_ok=True)
 
+    total_steps = cfg.train.epochs * len(train_loader)
+
+    def lr_lambda(step: int) -> float:
+        progress = step / max(1, total_steps)
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=cfg.train.epochs
-        )
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     if cfg.resume:
         with warnings.catch_warnings():
@@ -284,9 +305,8 @@ def main(cfg: Config):
         if is_main:
             print(f"\n=== Epoch {epoch}/{cfg.train.epochs} ===")
         train_loss = train_one_epoch(
-            model, raw_model, train_loader, optimizer, scaler, miner, evaluator, cfg, epoch
+            model, raw_model, train_loader, optimizer, scaler, scheduler, miner, evaluator, cfg, epoch
         )
-        scheduler.step()
 
         if epoch % cfg.train.eval_every == 0:
             # All ranks evaluate — avoids rank 0 blocking others during a long eval window

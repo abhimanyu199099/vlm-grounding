@@ -164,7 +164,7 @@ def get_proposals(image: Image.Image,
     if method == "grid":
         # Multi-scale sliding windows: scales × strides give proposals that can
         # achieve IoU ≥ 0.5 with GT boxes of varied sizes.
-        for scale in [0.25, 0.4, 0.6, 0.8, 1.0]:
+        for scale in [0.4, 0.6, 0.8, 1.0]:
             bw, bh = W * scale, H * scale
             stride_x = max(bw * 0.5, 1)
             stride_y = max(bh * 0.5, 1)
@@ -300,27 +300,30 @@ class Flickr30kGroundingDataset(Dataset):
                                           self.cfg.data.max_proposals)
                 pos_idx   = _find_best_proposal(proposals, gt_box)
 
-                # phrase_tokens still needed for attn_mask in grounding_model
-                phrase_tokens = self.tokenizer(
+                # phrase_tokens + attention_mask needed for grounding_model
+                encoding = self.tokenizer(
                     phrase_dict["phrase"],
                     return_tensors="pt",
                     padding="max_length",
                     truncation=True,
                     max_length=77,
-                ).input_ids.squeeze(0)
+                )
+                phrase_tokens = encoding.input_ids.squeeze(0)
+                phrase_attn_mask = encoding.attention_mask.squeeze(0).bool()
 
                 return {
-                    "image_id":      img_id,
-                    "phrase":        phrase_dict["phrase"],
-                    "phrase_tokens": phrase_tokens,
-                    "proposals":     proposals,
-                    "pos_idx":       pos_idx,
-                    "gt_box":        gt_box,
-                    "entity_type":   phrase_dict["entity_type"],
+                    "image_id":        img_id,
+                    "phrase":          phrase_dict["phrase"],
+                    "phrase_tokens":   phrase_tokens,
+                    "phrase_attn_mask": phrase_attn_mask,
+                    "proposals":       proposals,
+                    "pos_idx":         pos_idx,
+                    "gt_box":          gt_box,
+                    "entity_type":     phrase_dict["entity_type"],
                     # pre-computed embeddings — no proposal_crops
-                    "text_hidden":   text_hidden,
-                    "region_embeds": region_embeds,
-                    "phrase_embed":  phrase_embed,
+                    "text_hidden":     text_hidden,
+                    "region_embeds":   region_embeds,
+                    "phrase_embed":    phrase_embed,
                 }
 
         # ---- Fallback: compute on the fly ----
@@ -330,23 +333,26 @@ class Flickr30kGroundingDataset(Dataset):
         pos_idx        = _find_best_proposal(proposals, gt_box)
         proposal_crops = _crop_proposals(image, proposals, self.transform)
 
-        phrase_tokens = self.tokenizer(
+        encoding = self.tokenizer(
             phrase_dict["phrase"],
             return_tensors="pt",
             padding="max_length",
             truncation=True,
             max_length=77,
-        ).input_ids.squeeze(0)
+        )
+        phrase_tokens    = encoding.input_ids.squeeze(0)
+        phrase_attn_mask = encoding.attention_mask.squeeze(0).bool()
 
         return {
-            "image_id":       img_id,
-            "phrase":         phrase_dict["phrase"],
-            "phrase_tokens":  phrase_tokens,
-            "proposals":      proposals,
-            "proposal_crops": proposal_crops,
-            "pos_idx":        pos_idx,
-            "gt_box":         gt_box,
-            "entity_type":    phrase_dict["entity_type"],
+            "image_id":         img_id,
+            "phrase":           phrase_dict["phrase"],
+            "phrase_tokens":    phrase_tokens,
+            "phrase_attn_mask": phrase_attn_mask,
+            "proposals":        proposals,
+            "proposal_crops":   proposal_crops,
+            "pos_idx":          pos_idx,
+            "gt_box":           gt_box,
+            "entity_type":      phrase_dict["entity_type"],
         }
 
 
@@ -420,7 +426,8 @@ def collate_fn(batch: List[dict]) -> dict:
         "image_id":      [item["image_id"]    for item in batch],
         "phrase":        [item["phrase"]       for item in batch],
         "entity_type":   [item["entity_type"]  for item in batch],
-        "phrase_tokens": torch.stack([item["phrase_tokens"] for item in batch]),
+        "phrase_tokens":    torch.stack([item["phrase_tokens"]    for item in batch]),
+        "phrase_attn_mask": torch.stack([item["phrase_attn_mask"] for item in batch]),
         "proposals":     torch.stack(padded_proposals),
         "proposal_mask": torch.stack(masks),
         "pos_idx":       torch.tensor([item["pos_idx"] for item in batch], dtype=torch.long),

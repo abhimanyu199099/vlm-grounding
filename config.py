@@ -62,23 +62,22 @@ class ModelConfig:
     clip_model:      str   = "openai/clip-vit-base-patch32"  # HuggingFace model id
     freeze_clip:     bool  = True                             # always True for direction 1
     embed_dim:       int   = 512                              # CLIP ViT-B/32 output dim
-    num_heads:       int   = 8                                # cross-attention heads
-    head_depth:      int   = 1                                # number of cross-attn layers
+    proj_dim:        int   = 256                              # shared text/region projection dim
+    num_heads:       int   = 8                                # cross-attention heads (unused by new head)
+    head_depth:      int   = 1                                # cross-attn layers (unused by new head)
     lora_rank:       int   = 8                                # LoRA rank; 0 = disable LoRA
-    lora_alpha:      float = 16.0
+    lora_alpha:      float = 32.0
     dropout:         float = 0.1
-
-    # Token-weighting MLP
-    token_weighter_hidden_dim: int = 64   # hidden size of the per-token scalar MLP
 
     # Hard-negative contrastive loss
     hard_neg_k:              int   = 4     # top-k wrong regions to use as hard negatives
     hard_neg_penalty:        float = 1.5  # logit scale for hard negatives (>1 = harder)
     contrastive_temperature: float = 0.07 # InfoNCE temperature
-    contrastive_loss_weight: float = 0.5  # weight of contrastive loss in total loss
+    contrastive_loss_weight: float = 0.0  # disabled for isolation test
 
-    # Token-focused entropy loss
-    entropy_loss_weight:     float = 0.1  # weight of entropy regularisation in total loss
+    # Hinge entropy loss
+    entropy_loss_weight: float = 0.0   # disabled for isolation test
+    entropy_target:      float = 2.2   # minimum acceptable token entropy before penalising
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +86,7 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    max_proposals:      int   = 30     # max region proposals per image
+    max_proposals:      int   = 50     # max region proposals per image
     proposal_method:    Literal["selective_search", "grid"] = "grid"
     neg_strategy:       Literal["inbatch", "clip_mined", "cross_image", "all"] = "inbatch"
     clip_mine_topk:     int   = 5      # how many hard negatives to mine per phrase via CLIP
@@ -107,7 +106,7 @@ class DataConfig:
 class TrainConfig:
     batch_size:     int   = 16
     epochs:         int   = 10
-    lr:             float = 2.5e-3
+    lr:             float = 5e-4
     weight_decay:   float = 1e-2
     warmup_steps:   int   = 500
     grad_clip:      float = 1.0
