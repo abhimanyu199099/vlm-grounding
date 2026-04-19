@@ -160,8 +160,9 @@ class GroundingHead(nn.Module):
 
         # ---- 7. Mask + temperature ----
         scores = scores.masked_fill(~proposal_mask, float("-inf"))
-        # Clamp log_temp to [-4, 4] → temperature in [0.018, 55] — prevents explosion
-        temp   = self.log_temp.clamp(-4.0, 4.0).exp()
+        # Clamp log_temp to [-2, 4] → temperature in [0.135, 55] — prevents numerical instability
+        # (minimum 0.135 is safer for backprop than 0.018, avoiding underflow)
+        temp   = self.log_temp.clamp(-2.0, 4.0).exp()
         scores = scores * temp
 
         # query: weighted sum of enhanced text features (for contrastive loss)

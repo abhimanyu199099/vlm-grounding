@@ -97,7 +97,7 @@ def hard_negative_contrastive_loss(
       5. Apply cross-entropy with the positive at index 0.
 
     If fewer than k valid negatives exist for an item (e.g., only 1 region),
-    the surplus logit slots are -inf → exp(-inf)=0, which is safe for CE.
+    pads with -100.0 (a standard CE ignore value that won't cause NaN).
     """
     B, N, D = region_embeds.shape
     device  = phrase_embeds.device
@@ -116,19 +116,28 @@ def hard_negative_contrastive_loss(
     pos_one_hot.scatter_(1, pos_idx_.unsqueeze(1), True)
     neg_mask = proposal_mask & ~pos_one_hot                           # (B, N)
 
-    # Guard: if no valid negatives exist, return a graph-connected zero so DDP
-    # allreduces complete on all ranks (a detached constant breaks DDP sync).
-    if k == 0 or not neg_mask.any():
+    # Guard: if no valid negatives exist, return zero loss (graph-connected)
+    # Use graph connection to ensure DDP allreduce works on all ranks.
+    num_negatives_per_sample = neg_mask.sum(dim=1)  # (B,)
+    if (num_negatives_per_sample == 0).all():
         return (phrase_embeds.sum() + region_embeds.sum()) * 0.0
 
-    # Set invalid / positive positions to -inf, then take top-k
-    sim_neg  = sim.masked_fill(~neg_mask, float("-inf"))              # (B, N)
-    actual_k = min(k, N - 1)
+    # Set invalid / positive positions to very negative value (not -inf to avoid NaN)
+    # -1e8 is small enough to be effectively zero after softmax but won't cause NaN division
+    sim_neg  = sim.masked_fill(~neg_mask, -1e8)                       # (B, N)
+    actual_k = min(k, int(num_negatives_per_sample.min().item()))
+    
+    # If we can't get any hard negatives, return zero loss
+    if actual_k <= 0:
+        return (phrase_embeds.sum() + region_embeds.sum()) * 0.0
+    
     topk_scores, _ = sim_neg.topk(actual_k, dim=1)                   # (B, k)
 
     # Temperature-scale then apply penalty as additive logit offset.
     # Multiplicative scaling on raw similarities is wrong because it changes
     # the sign of negative similarities, making easy negatives even easier.
+    # Clamp temperature to prevent underflow: min 0.01
+    temperature = max(temperature, 0.01)
     log_penalty = math.log(penalty_factor)
     pos_logit  = pos_scores / temperature                             # (B,)
     neg_logits = topk_scores / temperature + log_penalty             # (B, k)
@@ -162,7 +171,13 @@ def token_entropy_loss(
       3. Return mean(max(0, target - entropy)) — zero loss when entropy >= target.
     """
     w = token_weights.masked_fill(~token_mask, 0.0)
-    w = w / (w.sum(dim=-1, keepdim=True) + eps)
+    w_sum = w.sum(dim=-1, keepdim=True)
+    
+    # Guard: if a sequence has no valid tokens, skip it to avoid log(0)
+    # Return zero loss for that sample (this shouldn't happen in practice)
+    w_sum = torch.clamp(w_sum, min=eps)
+    w = w / w_sum
+    
     per_token   = -w * torch.log(w + eps)
     seq_entropy = per_token.sum(dim=-1)                               # (B,)
     loss = torch.clamp(target - seq_entropy, min=0.0)
