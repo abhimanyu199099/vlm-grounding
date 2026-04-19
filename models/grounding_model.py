@@ -115,24 +115,31 @@ class GroundingModel(nn.Module):
         """
         device = next(self.head.parameters()).device
 
-        phrase_tokens = batch["phrase_tokens"].to(device)         # (B, 77)
-        attn_mask     = (phrase_tokens != 0).to(device)           # (B, 77)
-        images        = batch["images"].to(device)                # (B, 3, 224, 224)
-        image_sizes   = batch["image_sizes"]
+        phrase_tokens = batch["phrase_tokens"].to(device, non_blocking=True)   # (B, 77)
+        pos_idx       = batch["pos_idx"].to(device, non_blocking=True)         # (B,)
 
-        # ---- RPN encode ----
-        rpn_feats, rpn_boxes_xyxy, rpn_mask = self.rpn_encoder(images, image_sizes)
+        proposal_mask = batch.get("proposal_mask")
+        if proposal_mask is not None:
+            proposal_mask = proposal_mask.to(device, non_blocking=True)        # (B, N) bool
 
-        # Recompute pos_idx against RPN box order
-        gt_box_xyxy = batch["gt_box"].to(device)                  # (B, 4) pixel xyxy
-        pos_idx     = _compute_pos_idx(rpn_boxes_xyxy, gt_box_xyxy, rpn_mask)
+        proposals = batch.get("proposals")
+        if proposals is not None:
+            proposals = proposals.to(device, non_blocking=True)                # (B, N, 4)
 
-        # Positional encoding on normalized boxes
-        boxes_norm    = xyxy_pixel_to_cxcywh_norm(rpn_boxes_xyxy, image_size=224)
-        pos_enc       = self.box_pos_enc(boxes_norm)              # (B, N, D)
-        region_embeds = self.encoder.encode_region_from_features(
-            rpn_feats + pos_enc
-        )                                                         # (B, N, D_proj)
+        # Use tokenizer's attention_mask directly — pad_token_id=49407 (not 0),
+        # so (phrase_tokens != 0) would incorrectly mark all positions as real.
+        attn_mask = batch["phrase_attn_mask"].to(device, non_blocking=True)    # (B, 77)
+
+        # ---- Encode — skip if pre-computed embeddings are in the batch ----
+        if "text_hidden" in batch and "region_embeds" in batch:
+            text_hidden   = batch["text_hidden"].to(device, non_blocking=True)    # (B, L, D_text)
+            region_embeds = batch["region_embeds"].to(device, non_blocking=True)  # (B, N, D_proj)
+            phrase_embeds = batch["phrase_embed"].to(device, non_blocking=True)   # (B, D_proj)
+        else:
+            proposal_crops = batch["proposal_crops"].to(device, non_blocking=True)  # (B, N, 3, H, W)
+            text_hidden    = self.encoder.encode_text(phrase_tokens, attn_mask)
+            region_embeds  = self.encoder.encode_region(proposal_crops)
+            phrase_embeds  = self.encoder.encode_phrase(phrase_tokens, attn_mask)
 
         text_hidden   = self.encoder.encode_text(phrase_tokens, attn_mask)
         phrase_embeds = self.encoder.encode_phrase(phrase_tokens, attn_mask)
@@ -142,25 +149,37 @@ class GroundingModel(nn.Module):
             text_hidden=text_hidden,
             region_embeds=region_embeds,
             text_mask=attn_mask,
-            proposal_mask=rpn_mask,
-        )                                                         # (B,N), (B,L), (B,D), (B,4)
+            proposal_mask=proposal_mask,
+            proposals=proposals,
+        )                                                           # (B,N), (B,L), (B,d)
 
         cfg_m = self.cfg.model
 
         # ---- Loss 1: grounding CE ----
         g_loss = grounding_loss(scores, pos_idx)
 
-        # ---- Loss 2: in-batch contrastive ----
-        c_loss = inbatch_contrastive_loss(
-            phrase_embeds=phrase_embeds,
-            region_embeds=region_embeds,
+        # ---- Loss 2: hard-negative contrastive loss ----
+        # Use the head's query (learned weighted-text projection, dim=proj_dim) so that
+        # the contrastive loss actually trains the head's parameters.
+        # region_embeds are already L2-normalised from encode_region().
+        phrase_q    = F.normalize(query.float(), dim=-1).to(query.dtype)
+        phrase_q    = torch.nan_to_num(phrase_q, nan=0.0)
+        rp          = self.head.region_proj(region_embeds)
+        region_norm = F.normalize(rp.float(), dim=-1).to(rp.dtype)
+        region_norm = torch.nan_to_num(region_norm, nan=0.0)
+        cfg_m         = self.cfg.model
+        c_loss = hard_negative_contrastive_loss(
+            phrase_embeds=phrase_q,
+            region_embeds=region_norm,
             pos_idx=pos_idx,
             proposal_mask=rpn_mask,
             temperature=cfg_m.contrastive_temperature,
         )
 
-        # ---- Loss 3: token entropy ----
-        e_loss = token_entropy_loss(token_weights, attn_mask.bool())
+        # ---- Loss 3: token entropy regularisation ----
+        e_loss = token_entropy_loss(
+            token_weights, attn_mask.bool(), target=cfg_m.entropy_target
+        )
 
         # ---- Loss 4: localization ----
         gt_box_norm = batch["gt_box_norm"].to(device)             # (B, 4) normalized cxcywh

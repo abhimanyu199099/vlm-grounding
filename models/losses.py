@@ -1,10 +1,21 @@
 """
 models/losses.py — all loss functions for the grounding model.
 
-  grounding_loss()        — cross-entropy over proposal scores (plain CE).
-  inbatch_contrastive_loss() — cross-batch InfoNCE: phrase vs all regions in batch.
-  token_entropy_loss()    — entropy minimisation on token weights.
-  localization_loss()     — L1 + GIoU on direct box prediction.
+Three losses:
+
+  grounding_loss()
+      Original cross-entropy / hard-negative CE over proposal scores.
+      Supports three modes (plain CE, per-image hard negs, cross-batch hard negs).
+
+  hard_negative_contrastive_loss()
+      InfoNCE-style loss that explicitly penalises the top-k wrong-but-high-scoring
+      regions (hard negatives) for each phrase.
+      Applied on L2-normalised phrase embeddings vs region embeddings.
+
+  token_entropy_loss()
+      Hinge entropy regularisation on token weights.
+      Penalises only when entropy is below a target threshold, preventing collapse
+      while still allowing the model to focus on important tokens.
 """
 
 from typing import Optional
@@ -113,24 +124,26 @@ def inbatch_contrastive_loss(
 # ---------------------------------------------------------------------------
 
 def token_entropy_loss(
-    token_weights: torch.Tensor,   # (B, L)  softmax outputs from TokenWeightingMLP
+    token_weights: torch.Tensor,   # (B, L)  softmax outputs from token scorer
     token_mask:    torch.Tensor,   # (B, L)  bool, True = real token
     eps:           float = 1e-8,
+    target:        float = 1.0,
 ) -> torch.Tensor:
     """
-    Entropy minimisation over token weights.
+    Hinge entropy regularisation over token weights.
 
-    Lower entropy = more peaked distribution = model focuses on fewer, more
-    important tokens (e.g., "blue", "shirt" rather than "a", "the").
+    Only penalises when entropy is below `target`, preventing weight collapse
+    (where the model fixates on a single token and ignores relation words like
+    "under"/"over"). Does not penalise distributions that are already spread enough.
 
-    We return mean(H) where H_i = -sum_l( w_il * log(w_il + eps) ) over real
-    tokens only. Minimising this during training encourages focus.
-
-    Padding positions are explicitly zeroed to avoid log(0+eps) noise, even
-    though the MLP's masked softmax already makes them ~0.
+    Steps:
+      1. Zero out padding tokens and renormalise to a valid probability distribution.
+      2. Compute per-sequence Shannon entropy over real tokens.
+      3. Return mean(max(0, target - entropy)) — zero loss when entropy >= target.
     """
-    # Explicit zero-out for numerical safety
-    w = token_weights * token_mask.float()                            # (B, L)
-    per_token = -w * torch.log(w.clamp(min=eps))                     # (B, L)
+    w = token_weights.masked_fill(~token_mask, 0.0)
+    w = w / (w.sum(dim=-1, keepdim=True) + eps)
+    per_token   = -w * torch.log(w + eps)
     seq_entropy = per_token.sum(dim=-1)                               # (B,)
-    return seq_entropy.mean()                                         # scalar
+    loss = torch.clamp(target - seq_entropy, min=0.0)
+    return loss.mean()                                                # scalar
