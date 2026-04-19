@@ -84,7 +84,7 @@ def train_one_epoch(model, raw_model, loader, optimizer, scaler, scheduler, mine
             neg_indices, cross_image = miner.mine(batch, phrase_embeds, region_embeds)
             neg_mining = (neg_indices, cross_image)
 
-        with autocast('cuda', enabled=cfg.train.mixed_precision):
+        with autocast(device.type, enabled=cfg.train.mixed_precision):
             out  = model(batch, neg_mining=neg_mining)
             loss = out["loss"]
 
@@ -342,18 +342,13 @@ def main(cfg: Config):
     else:
         model = raw_model
 
-    # Optimizer — per-module learning rates
-    head = raw_model.head
-    optimizer = torch.optim.AdamW([
-        {"params": head.text_proj.parameters(),      "lr": 1e-4},
-        {"params": head.token_weighter.parameters(), "lr": 1e-4},
-        {"params": head.region_proj.parameters(),    "lr": 2e-4},
-        {"params": head.layers.parameters(),         "lr": 2e-4},
-        {"params": head.scorer.parameters(),         "lr": 1e-4},
-        {"params": head.box_head.parameters(),       "lr": 3e-4},
-        {"params": raw_model.box_pos_enc.parameters(), "lr": 3e-4},
-    ], weight_decay=cfg.train.weight_decay)
-    scaler = GradScaler('cuda', enabled=cfg.train.mixed_precision)
+    # Optimizer (only trainable params)
+    optimizer = torch.optim.AdamW(
+        raw_model.trainable_parameters,
+        lr=cfg.train.lr,
+        weight_decay=cfg.train.weight_decay,
+    )
+    scaler = GradScaler(device.type, enabled=cfg.train.mixed_precision)
     miner  = NegativeMiner(cfg, clip_model=raw_model.encoder.clip)
 
     # Training loop
@@ -398,7 +393,12 @@ def main(cfg: Config):
             metrics = evaluate(raw_model, val_loader, evaluator, cfg)
             if is_main:
                 acc = metrics["acc@0.5"]
-                print(f"  Val Acc@0.5: {acc:.4f}  |  Recall@5: {metrics.get('recall@5', '?')}  |  mAP50: {metrics.get('mAP50', '?')}  |  mean IoU: {metrics['mean_iou']:.4f}")
+                print(f"  Val Acc@0.5: {acc:.4f}  |  mean IoU: {metrics['mean_iou']:.4f}  |  "
+                      f"AP@0.25: {metrics.get('AP@0.25', '?')}  |  "
+                      f"AP@0.50: {metrics.get('AP@0.50', '?')}  |  "
+                      f"AP@0.75: {metrics.get('AP@0.75', '?')}  |  "
+                      f"mAP: {metrics.get('mAP', '?')}  |  "
+                      f"Recall@5: {metrics.get('recall@5', '?')}")
                 print(f"  Breakdown: {metrics['acc_by_type']}")
                 if acc > best_acc:
                     best_acc = acc
