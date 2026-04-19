@@ -118,6 +118,7 @@ class GroundingModel(nn.Module):
             region_embeds=region_embeds,
             text_mask=attn_mask,
             proposal_mask=proposal_mask,
+            proposals=batch.get("proposals", None),
         )                                                           # (B,N), (B,L), (B,D)
 
         # ---- Loss 1: grounding loss (CE over proposals) ----

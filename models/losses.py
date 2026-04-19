@@ -143,25 +143,18 @@ def hard_negative_contrastive_loss(
 # Token-focused entropy loss
 # ---------------------------------------------------------------------------
 
-def token_entropy_loss(
-    token_weights: torch.Tensor,   # (B, L)  softmax outputs from TokenWeightingMLP
-    token_mask:    torch.Tensor,   # (B, L)  bool, True = real token
-    eps:           float = 1e-8,
-) -> torch.Tensor:
-    """
-    Entropy minimisation over token weights.
+def token_entropy_loss(token_weights, token_mask, eps=1e-8, target=1.0):
+    # Mask out padding tokens
+    w = token_weights.masked_fill(~token_mask, 0.0)
 
-    Lower entropy = more peaked distribution = model focuses on fewer, more
-    important tokens (e.g., "blue", "shirt" rather than "a", "the").
+    # Re-normalize so probabilities sum to 1
+    w = w / (w.sum(dim=-1, keepdim=True) + eps)
 
-    We return mean(H) where H_i = -sum_l( w_il * log(w_il + eps) ) over real
-    tokens only. Minimising this during training encourages focus.
+    # Compute entropy
+    per_token = -w * torch.log(w + eps)
+    seq_entropy = per_token.sum(dim=-1)
 
-    Padding positions are explicitly zeroed to avoid log(0+eps) noise, even
-    though the MLP's masked softmax already makes them ~0.
-    """
-    # Explicit zero-out for numerical safety
-    w = token_weights * token_mask.float()                            # (B, L)
-    per_token = -w * torch.log(w + eps)                               # (B, L)
-    seq_entropy = per_token.sum(dim=-1)                               # (B,)
-    return seq_entropy.mean()                                         # scalar
+    # Hinge: only penalize if entropy too low
+    loss = torch.clamp(target - seq_entropy, min=0.0)
+
+    return loss.mean()                                   # scalar

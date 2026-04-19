@@ -183,73 +183,102 @@ class GroundingHead(nn.Module):
         """
         super().__init__()
         cfg = config.model
-        D   = cfg.embed_dim
+        # projected dim for lightweight interaction head
+        self.d = 256
 
-        self.text_proj      = nn.Linear(text_hidden_dim, D)
-        self.region_proj    = nn.Linear(region_proj_dim, D)
-        self.token_weighter = TokenWeightingMLP(
-            d_text=text_hidden_dim,
-            hidden_dim=cfg.token_weighter_hidden_dim,
-        )
+        # projections to compact space
+        self.text_proj   = nn.Linear(text_hidden_dim, self.d)
+        self.region_proj = nn.Linear(region_proj_dim, self.d)
 
-        self.layers = nn.ModuleList([
-            TextOverRegionAttention(
-                dim=D,
-                num_heads=cfg.num_heads,
-                dropout=cfg.dropout,
-            )
-            for _ in range(cfg.head_depth)
-        ])
+        # token scoring (d -> 1)
+        self.token_score = nn.Linear(self.d, 1)
 
-        self.norm   = nn.LayerNorm(D)
-        self.scorer = nn.Linear(D, D, bias=False)
+        # small spatial MLP for optional proposal geometry (4 -> d)
+        self.spatial_proj = nn.Linear(4, self.d)
 
-        # Temperature parameter — learned scalar for scoring stability
-        # Initialised to log(1/0.07) following CLIP convention
-        self.log_temp = nn.Parameter(torch.tensor(math.log(1 / 0.07)))
+        # keep a simple layernorm for stability
+        self.norm = nn.LayerNorm(self.d)
 
     def forward(self,
                 text_hidden:   torch.Tensor,                   # (B, L, D_text)
                 region_embeds: torch.Tensor,                   # (B, N, D_proj)
                 text_mask:     Optional[torch.Tensor] = None,  # (B, L) bool
                 proposal_mask: Optional[torch.Tensor] = None,  # (B, N) bool
+                proposals:     Optional[torch.Tensor] = None,  # (B, N, 4) optional spatial coords
                 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Token–region interaction head (lightweight).
+
+        Implements:
+          text_proj: (B,L,d)
+          region_proj: (B,N,d)
+          token scoring -> token_weights (B,L)
+          sim = einsum("bld,bnd->bln")
+          scores = sum_l token_weights * sim -> (B,N)
+
+        Also performs a single cross-attention-style enhancement (cheap) and
+        optionally incorporates spatial features from `proposals` if provided.
         """
-        Returns:
-            scores        : (B, N)  un-normalised logits (padding → -inf)
-            token_weights : (B, L)  per-token importance weights (sum=1 over real tokens)
-            query         : (B, D)  weighted phrase embedding before scorer projection
-        """
-        text    = self.text_proj(text_hidden)        # (B, L, D)
-        regions = self.region_proj(region_embeds)    # (B, N, D)
+        B, L, _ = text_hidden.shape
+        N = region_embeds.size(1)
+        device = text_hidden.device
 
-        for layer in self.layers:
-            text = layer(text, regions, region_mask=proposal_mask)
+        # Project to compact space
+        text_p = self.text_proj(text_hidden)           # (B, L, d)
+        region_p = self.region_proj(region_embeds)     # (B, N, d)
 
-        text = self.norm(text)
+        # Normalize projected features
+        text_p = F.normalize(text_p, dim=-1)
+        region_p = F.normalize(region_p, dim=-1)
 
-        # Token-weighted pooling — replaces mean-pool
-        # token_weighter operates on the *raw* text_hidden (pre text_proj) so
-        # the weighting MLP sees the original CLIP token features and is not
-        # influenced by the cross-attention layers (cleaner gradient signal).
+        # Token scoring -> token_weights
+        token_logits = self.token_score(text_p).squeeze(-1)  # (B, L)
         if text_mask is not None:
-            token_weights = self.token_weighter(text_hidden, text_mask)  # (B, L)
-        else:
-            # No mask: treat all positions as real tokens
-            all_real = torch.ones(
-                text_hidden.shape[:2], dtype=torch.bool, device=text_hidden.device
-            )
-            token_weights = self.token_weighter(text_hidden, all_real)  # (B, L)
+            token_logits = token_logits.masked_fill(~text_mask, float("-inf"))
+        token_weights = torch.softmax(token_logits, dim=-1)  # (B, L)
 
-        # Weighted sum over the cross-attended text features
-        pooled = (token_weights.unsqueeze(-1) * text).sum(dim=1)        # (B, D)
+        # Token–region similarity: (B, L, N)
+        sim = torch.einsum("bld,bnd->bln", text_p, region_p)
 
-        query  = self.scorer(pooled)                                     # (B, D)
-        temp   = self.log_temp.exp().clamp(max=100.0)
-        scores = torch.einsum("bd,bnd->bn", query, regions) * temp      # (B, N)
+        # Lightweight cross-attention enhancement (optional but enabled):
+        # attn over regions per token, produce context and enhance text_p
+        scale = (self.d ** 0.5)
+        attn = torch.softmax(sim / scale, dim=-1)                      # (B, L, N)
+        context = torch.einsum("bln,bnd->bld", attn, region_p)       # (B, L, d)
+        enhanced_text = text_p + context                               # (B, L, d)
 
+        # Recompute similarity using enhanced text (keeps token_weights from text_p)
+        enhanced_text = self.norm(enhanced_text)
+        sim2 = torch.einsum("bld,bnd->bln", enhanced_text, region_p)  # (B, L, N)
+
+        # Aggregate scores across tokens
+        scores = (token_weights.unsqueeze(-1) * sim2).sum(dim=1)       # (B, N)
+
+        # If `proposals` provided, incorporate geometry features (B, N, 4)
+        if proposals is not None:
+            prop = proposals.to(device)
+            x1, y1, x2, y2 = prop.unbind(-1)
+            cx = (x1 + x2) * 0.5
+            cy = (y1 + y2) * 0.5
+            w = (x2 - x1)
+            h = (y2 - y1)
+            # normalize by image-wise max extent to keep features in [0,1]
+            max_x = prop[..., 2].amax(dim=1).unsqueeze(-1)            # (B,1)
+            max_y = prop[..., 3].amax(dim=1).unsqueeze(-1)
+            denom = torch.maximum(max_x, max_y).unsqueeze(-1) + 1e-6
+            geom = torch.stack([cx.unsqueeze(-1), cy.unsqueeze(-1), w.unsqueeze(-1), h.unsqueeze(-1)], dim=-1)
+            geom = geom / denom.unsqueeze(1)  # (B, N, 4) normalized
+            geom_feat = self.spatial_proj(geom)  # (B, N, d)
+            region_p = F.normalize(region_p + geom_feat, dim=-1)
+            # recompute sim with spatial-enhanced regions
+            sim2 = torch.einsum("bld,bnd->bln", enhanced_text, region_p)
+            scores = (token_weights.unsqueeze(-1) * sim2).sum(dim=1)
+
+        # Mask invalid proposals
         if proposal_mask is not None:
             scores = scores.masked_fill(~proposal_mask, float("-inf"))
+
+        # Query: pooled enhanced text (weighted by token_weights)
+        query = (token_weights.unsqueeze(-1) * enhanced_text).sum(dim=1)  # (B, d)
 
         return scores, token_weights, query
 
