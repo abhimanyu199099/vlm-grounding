@@ -113,8 +113,8 @@ class TrainConfig:
     log_every:      int   = 10         # steps
     eval_every:     int   = 1          # epochs
     save_every:     int   = 1          # epochs
-    device:         str   = "cuda"     # "cpu" for debugging
-    mixed_precision: bool = True
+    device:         str   = "cpu"
+    mixed_precision: bool = False
     seed:           int   = 42
 
 

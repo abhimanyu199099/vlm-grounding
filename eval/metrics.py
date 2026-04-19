@@ -80,7 +80,9 @@ class GroundingEvaluator:
         self._correct_50:   List[bool]  = []
         self._correct_25:   List[bool]  = []
         self._entity_types: List[str]   = []
-        self._ap_scores:    List[float] = []   # per-phrase AP for mAP50
+        self._ap_25:        List[float] = []   # per-phrase AP at IoU≥0.25
+        self._ap_50:        List[float] = []   # per-phrase AP at IoU≥0.50
+        self._ap_75:        List[float] = []   # per-phrase AP at IoU≥0.75
         self._recall5:      List[bool]  = []   # any of top-5 correct at IoU≥0.5
 
     def set_baseline(self, baseline_acc: float):
@@ -138,17 +140,24 @@ class GroundingEvaluator:
         if scores is not None:
             scores = scores.cpu()
             for i in range(B):
-                ranked = scores[i].argsort(descending=True)  # indices sorted by score
+                ranked = scores[i].argsort(descending=True)
                 gt     = gt_boxes[i]
-                ap     = 0.0
-                r5     = False
+                ap25 = ap50 = ap75 = 0.0
+                r5   = False
                 for rank, idx in enumerate(ranked):
-                    hit = iou(proposals[i, idx], gt) >= self.threshold_high
-                    if hit:
-                        ap = 1.0 / (rank + 1)   # AP = precision at first correct rank
-                        r5 = rank < 5
+                    iou_val = iou(proposals[i, idx], gt)
+                    if ap25 == 0.0 and iou_val >= 0.25:
+                        ap25 = 1.0 / (rank + 1)
+                    if ap50 == 0.0 and iou_val >= 0.50:
+                        ap50 = 1.0 / (rank + 1)
+                        r5   = rank < 5
+                    if ap75 == 0.0 and iou_val >= 0.75:
+                        ap75 = 1.0 / (rank + 1)
+                    if ap25 and ap50 and ap75:
                         break
-                self._ap_scores.append(ap)
+                self._ap_25.append(ap25)
+                self._ap_50.append(ap50)
+                self._ap_75.append(ap75)
                 self._recall5.append(r5)
 
     # ------------------------------------------------------------------
@@ -199,7 +208,10 @@ class GroundingEvaluator:
             "acc_by_type":    acc_by_type,
             "baseline_delta": delta,
         }
-        if self._ap_scores:
-            out["mAP50"]     = round(sum(self._ap_scores) / len(self._ap_scores), 4)
-            out["recall@5"]  = round(sum(self._recall5)   / len(self._recall5),   4)
+        if self._ap_50:
+            out["AP@0.25"]   = round(sum(self._ap_25)  / len(self._ap_25),  4)
+            out["AP@0.50"]   = round(sum(self._ap_50)  / len(self._ap_50),  4)
+            out["AP@0.75"]   = round(sum(self._ap_75)  / len(self._ap_75),  4)
+            out["mAP"]       = round((out["AP@0.25"] + out["AP@0.50"] + out["AP@0.75"]) / 3, 4)
+            out["recall@5"]  = round(sum(self._recall5) / len(self._recall5), 4)
         return out
