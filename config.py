@@ -73,10 +73,10 @@ class ModelConfig:
     hard_neg_k:              int   = 4     # top-k wrong regions to use as hard negatives
     hard_neg_penalty:        float = 1.5  # logit scale for hard negatives (>1 = harder)
     contrastive_temperature: float = 0.07 # InfoNCE temperature
-    contrastive_loss_weight: float = 0.0  # disabled for isolation test
+    contrastive_loss_weight: float = 0.5  # disabled for isolation test
 
     # Hinge entropy loss
-    entropy_loss_weight: float = 0.0   # disabled for isolation test
+    entropy_loss_weight: float = 0.1   # disabled for isolation test
     entropy_target:      float = 2.2   # minimum acceptable token entropy before penalising
 
 
@@ -104,16 +104,17 @@ class DataConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size:     int   = 16
+    batch_size:     int   = 24
     epochs:         int   = 10
     lr:             float = 5e-4
     weight_decay:   float = 1e-2
-    warmup_steps:   int   = 500
+    warmup_steps:   int   = 100
+    min_lr_ratio:   float = 0.1          # LR floor as fraction of peak (cosine decays to this)
     grad_clip:      float = 1.0
     log_every:      int   = 10         # steps
     eval_every:     int   = 1          # epochs
     save_every:     int   = 1          # epochs
-    device:         str   = "cpu"
+    device:         str   = "cuda"
     mixed_precision: bool = False
     seed:           int   = 42
 
@@ -124,7 +125,7 @@ class TrainConfig:
 
 @dataclass
 class EvalConfig:
-    iou_threshold:  float = 0.25        # Acc@0.25 threshold
+    iou_threshold:  float = 0.5         # Acc@0.5 threshold (standard Flickr30k benchmark)
     max_preds:      int   = 1          # top-1 prediction per phrase
     split:          str   = "val"      # "val" or "test"
 

@@ -53,6 +53,7 @@ def grounding_loss(scores:       torch.Tensor,                   # (B, N)
     pos_idx = pos_idx.clamp(0, N - 1)  # guard against edge cases
 
     if neg_indices is None:
+        scores = torch.clamp(scores, min=1e6)
         return F.cross_entropy(scores, pos_idx)
 
     batch_idx  = torch.arange(B, device=device)
@@ -68,7 +69,8 @@ def grounding_loss(scores:       torch.Tensor,                   # (B, N)
         batch_idx.unsqueeze(1).expand_as(neg_indices),
         neg_indices,
     ]                                                                   # (B, K)
-    logits = torch.cat([pos_scores, neg_scores], dim=1)                # (B, 1+K)
+    logits = torch.cat([pos_scores, neg_scores], dim=1)
+    logits = torch.clamp(logits, min=-1e6)                # (B, 1+K)
     labels = torch.zeros(B, dtype=torch.long, device=device)
     return F.cross_entropy(logits, labels)
 
