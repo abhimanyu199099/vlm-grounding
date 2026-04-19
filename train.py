@@ -86,7 +86,9 @@ def train_one_epoch(model, raw_model, loader, optimizer, scaler, scheduler, mine
             loss = out["loss"]
 
         if not torch.isfinite(loss):
+            print("non-finite losses here")
             optimizer.zero_grad()
+            scheduler.step()
             continue
 
         scaler.scale(loss).backward()
@@ -277,9 +279,17 @@ def main(cfg: Config):
 
     total_steps = cfg.train.epochs * len(train_loader)
 
+    warmup   = cfg.train.warmup_steps
+    min_lr   = cfg.train.min_lr_ratio
+
     def lr_lambda(step: int) -> float:
-        progress = step / max(1, total_steps)
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        # step+1 so the very first optimizer update gets lr = 1/warmup, not 0
+        s = step + 1
+        if s < warmup:
+            return s / max(1, warmup)
+        progress = (s - warmup) / max(1, total_steps - warmup)
+        cosine   = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr + (1.0 - min_lr) * cosine
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)

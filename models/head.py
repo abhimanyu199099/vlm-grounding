@@ -121,14 +121,15 @@ class GroundingHead(nn.Module):
 
         # ---- 1. Project + optional spatial + normalise ----
         # Promote to fp32 for normalize — fp16 can underflow to 0 norm, causing NaN.
-        text    = F.normalize(self.text_proj(text_hidden).float(), dim=-1).to(text_hidden.dtype)
-        regions = self.region_proj(region_embeds)                               # (B, N, d)
+        t_proj  = self.text_proj(text_hidden).float()
+        text    = (t_proj / t_proj.norm(dim=-1, keepdim=True).clamp(min=1e-6)).to(text_hidden.dtype)
 
+        regions = self.region_proj(region_embeds)                               # (B, N, d)
         if proposals is not None:
             spatial = self.spatial_mlp(_encode_spatial(proposals))    # (B, N, d)
             regions = regions + spatial
-
-        regions = F.normalize(regions.float(), dim=-1).to(region_embeds.dtype) # (B, N, d)
+        r_proj  = regions.float()
+        regions = (r_proj / r_proj.norm(dim=-1, keepdim=True).clamp(min=1e-6)).to(region_embeds.dtype)
 
         # ---- 2. Token–region similarity ----
         sim = torch.einsum("bld,bnd->bln", text, regions)             # (B, L, N)
@@ -137,33 +138,33 @@ class GroundingHead(nn.Module):
         # Mask padding regions before softmax
         attn = sim / math.sqrt(d)                                      # (B, L, N)
         bad_regions = ~proposal_mask.unsqueeze(1)                      # (B, 1, N)
-        attn = attn.masked_fill(bad_regions, float("-inf"))
+        attn = attn.masked_fill(bad_regions, -1e4)
         attn = F.softmax(attn, dim=-1)
-        attn = torch.nan_to_num(attn, nan=0.0)                        # guard all-masked rows
 
         context  = torch.einsum("bln,bnd->bld", attn, regions)        # (B, L, d)
         residual = text + context
-        enhanced = F.normalize(residual.float(), dim=-1).to(text.dtype)  # (B, L, d)
-        enhanced = torch.nan_to_num(enhanced, nan=0.0)                 # guard zero-norm residuals
+        # Clamp norm instead of nan_to_num — nan_to_num zeros the gradient at NaN
+        # positions, which blocks all learning since every parameter path goes through here.
+        norm     = residual.float().norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        enhanced = (residual.float() / norm).to(text.dtype)            # (B, L, d)
 
         # ---- 4. Recompute sim with enhanced text ----
         sim = torch.einsum("bld,bnd->bln", enhanced, regions)         # (B, L, N)
 
         # ---- 5. Token weights from enhanced text ----
         token_logits  = self.token_scorer(enhanced).squeeze(-1)       # (B, L)
-        token_logits  = token_logits.masked_fill(~text_mask, float("-inf"))
+        token_logits  = token_logits.masked_fill(~text_mask, -1e4)
         token_weights = F.softmax(token_logits, dim=-1)               # (B, L)
-        token_weights = torch.nan_to_num(token_weights, nan=0.0)      # guard all-masked softmax
 
         # ---- 6. Aggregate over tokens ----
         scores = (token_weights.unsqueeze(-1) * sim).sum(dim=1)       # (B, N)
 
-        # ---- 7. Mask + temperature ----
-        scores = scores.masked_fill(~proposal_mask, float("-inf"))
-        # Clamp log_temp to [-2, 4] → temperature in [0.135, 55] — prevents numerical instability
-        # (minimum 0.135 is safer for backprop than 0.018, avoiding underflow)
+        # ---- 7. Temperature + mask ----
+        # Scale BEFORE masking: -inf * temp produces NaN gradients w.r.t. log_temp
+        # because softmax(-inf)=0 and 0 * -inf = NaN in the backward pass.
         temp   = self.log_temp.clamp(-2.0, 4.0).exp()
         scores = scores * temp
+        scores = scores.masked_fill(~proposal_mask, -1e8)
 
         # query: weighted sum of enhanced text features (for contrastive loss)
         query = (token_weights.unsqueeze(-1) * enhanced).sum(dim=1)   # (B, d)

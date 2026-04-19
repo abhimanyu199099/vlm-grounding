@@ -140,11 +140,11 @@ class GroundingModel(nn.Module):
         # Use the head's query (learned weighted-text projection, dim=proj_dim) so that
         # the contrastive loss actually trains the head's parameters.
         # region_embeds are already L2-normalised from encode_region().
-        phrase_q    = F.normalize(query.float(), dim=-1).to(query.dtype)
-        phrase_q    = torch.nan_to_num(phrase_q, nan=0.0)
+        q_norm      = query.float().norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        phrase_q    = (query.float() / q_norm).to(query.dtype)
         rp          = self.head.region_proj(region_embeds)
-        region_norm = F.normalize(rp.float(), dim=-1).to(rp.dtype)
-        region_norm = torch.nan_to_num(region_norm, nan=0.0)
+        rp_norm     = rp.float().norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        region_norm = (rp.float() / rp_norm).to(rp.dtype)
         cfg_m         = self.cfg.model
         c_loss = hard_negative_contrastive_loss(
             phrase_embeds=phrase_q,
