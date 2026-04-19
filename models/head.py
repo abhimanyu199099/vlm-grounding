@@ -196,17 +196,37 @@ class GroundingHead(nn.Module):
         # small spatial MLP for optional proposal geometry (4 -> d)
         self.spatial_proj = nn.Linear(4, self.d)
 
-        # keep a simple layernorm for stability
-        self.norm = nn.LayerNorm(self.d)
+        self.box_head = nn.Sequential(
+            nn.Linear(2 * D, D),
+            nn.ReLU(),
+            nn.Linear(D, D // 2),
+            nn.ReLU(),
+            nn.Linear(D // 2, 4),
+            nn.Sigmoid(),
+        )
+
+        # Temperature parameter — learned scalar for scoring stability
+        # Initialised to log(1/0.07) following CLIP convention
+        self.log_temp = nn.Parameter(torch.tensor(math.log(1 / 0.07)))
 
     def forward(self,
                 text_hidden:   torch.Tensor,                   # (B, L, D_text)
                 region_embeds: torch.Tensor,                   # (B, N, D_proj)
                 text_mask:     Optional[torch.Tensor] = None,  # (B, L) bool
                 proposal_mask: Optional[torch.Tensor] = None,  # (B, N) bool
-                proposals:     Optional[torch.Tensor] = None,  # (B, N, 4) optional spatial coords
-                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Token–region interaction head (lightweight).
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            scores        : (B, N)  un-normalised logits (padding → -inf)
+            token_weights : (B, L)  per-token importance weights (sum=1 over real tokens)
+            query         : (B, D)  weighted phrase embedding before scorer projection
+            pred_boxes    : (B, 4)  normalized cxcywh box prediction, values in [0, 1]
+        """
+        text    = self.text_proj(text_hidden)        # (B, L, D)
+        regions = self.region_proj(region_embeds)    # (B, N, D)
+
+        for layer in self.layers:
+            text = layer(text, regions, region_mask=proposal_mask)
 
         Implements:
           text_proj: (B,L,d)
@@ -215,20 +235,21 @@ class GroundingHead(nn.Module):
           sim = einsum("bld,bnd->bln")
           scores = sum_l token_weights * sim -> (B,N)
 
-        Also performs a single cross-attention-style enhancement (cheap) and
-        optionally incorporates spatial features from `proposals` if provided.
-        """
-        B, L, _ = text_hidden.shape
-        N = region_embeds.size(1)
-        device = text_hidden.device
+        # Token-weighted pooling on post-cross-attention text
+        if text_mask is not None:
+            token_weights = self.token_weighter(text, text_mask)  # (B, L)
+        else:
+            all_real = torch.ones(
+                text.shape[:2], dtype=torch.bool, device=text.device
+            )
+            token_weights = self.token_weighter(text, all_real)   # (B, L)
 
-        # Project to compact space
-        text_p = self.text_proj(text_hidden)           # (B, L, d)
-        region_p = self.region_proj(region_embeds)     # (B, N, d)
+        # Weighted sum over the cross-attended text features
+        pooled = (token_weights.unsqueeze(-1) * text).sum(dim=1)  # (B, D)
 
-        # Normalize projected features
-        text_p = F.normalize(text_p, dim=-1)
-        region_p = F.normalize(region_p, dim=-1)
+        query  = self.scorer(pooled)                               # (B, D)
+        temp   = self.log_temp.exp().clamp(max=100.0)
+        scores = torch.einsum("bd,bnd->bn", query, regions) * temp  # (B, N)
 
         # Token scoring -> token_weights
         token_logits = self.token_score(text_p).squeeze(-1)  # (B, L)
@@ -277,10 +298,14 @@ class GroundingHead(nn.Module):
         if proposal_mask is not None:
             scores = scores.masked_fill(~proposal_mask, float("-inf"))
 
-        # Query: pooled enhanced text (weighted by token_weights)
-        query = (token_weights.unsqueeze(-1) * enhanced_text).sum(dim=1)  # (B, d)
+        # Direct box prediction from attended phrase + score-weighted region
+        # nan_to_num guards the degenerate case where all proposals are masked (-inf→NaN)
+        score_weights  = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)  # (B, N)
+        attended_region = torch.einsum('bn,bnd->bd', score_weights, regions)   # (B, D)
+        box_input  = torch.cat([query, attended_region], dim=-1)               # (B, 2D)
+        pred_boxes = self.box_head(box_input)                                  # (B, 4) in [0,1]
 
-        return scores, token_weights, query
+        return scores, token_weights, query, pred_boxes
 
     def trainable_parameters(self):
         """Return only the parameters that require gradients (for the optimizer)."""

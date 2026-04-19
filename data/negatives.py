@@ -135,7 +135,7 @@ class NegativeMiner:
         # Set invalid positions to -inf before top-K
         sim = sim.masked_fill(~valid, float("-inf"))
 
-        K = min(K, valid.sum(dim=1).min().item())
+        K = min(K, B * N - N)  # at most all cross-image proposals
         K = max(K, 1)
         neg_indices = sim.topk(K, dim=1).indices                  # (B, K)
         return neg_indices
@@ -172,7 +172,7 @@ class NegativeMiner:
 
         # Mask the ground-truth proposal for each item using advanced indexing
         batch_idx = torch.arange(B, device=device)
-        sim[batch_idx, pos_idx] = float("-inf")
+        sim[batch_idx, pos_idx.clamp(0, N - 1)] = float("-inf")
 
         # Mask padding proposals
         if proposal_mask is not None:
@@ -230,7 +230,7 @@ class NegativeMiner:
         # --- For each item, collect GT region embeddings from same-type peers ---
         # gt_region[i] = region_embeds[i, pos_idx[i], :]  — the GT proposal embedding
         batch_idx  = torch.arange(B, device=device)
-        gt_regions = region_embeds[batch_idx, pos_idx]    # (B, D) — GT embed per item
+        gt_regions = region_embeds[batch_idx, pos_idx.clamp(0, N - 1)]  # (B, D)
 
         neg_indices = torch.zeros(B, K, dtype=torch.long, device=device)
 
@@ -240,7 +240,7 @@ class NegativeMiner:
             if not same_type:
                 # Fallback: clip_mined within this item's own image
                 sim_i  = torch.einsum("d,nd->n", phrase_embeds[i], region_embeds[i])
-                sim_i[pos_idx[i]] = float("-inf")
+                sim_i[pos_idx[i].clamp(0, N - 1)] = float("-inf")
                 if batch.get("proposal_mask") is not None:
                     sim_i = sim_i.masked_fill(~batch["proposal_mask"][i], float("-inf"))
                 k_i = min(K, N - 1)
@@ -264,7 +264,7 @@ class NegativeMiner:
                 # Similarity of peer GT against all of item i's proposals
                 sim_ij = torch.mv(region_embeds[i], peer_gt_embed)    # (N,)
                 # Exclude item i's own GT proposal
-                sim_ij[pos_idx[i]] = float("-inf")
+                sim_ij[pos_idx[i].clamp(0, N - 1)] = float("-inf")
                 if batch.get("proposal_mask") is not None:
                     sim_ij = sim_ij.masked_fill(~batch["proposal_mask"][i], float("-inf"))
                 neg_indices[i, slot] = sim_ij.argmax()
@@ -272,7 +272,7 @@ class NegativeMiner:
             # If k_peers < K, fill remaining slots with clip_mined fallback
             if k_peers < K:
                 sim_i = torch.einsum("d,nd->n", phrase_embeds[i], region_embeds[i])
-                sim_i[pos_idx[i]] = float("-inf")
+                sim_i[pos_idx[i].clamp(0, N - 1)] = float("-inf")
                 if batch.get("proposal_mask") is not None:
                     sim_i = sim_i.masked_fill(~batch["proposal_mask"][i], float("-inf"))
                 # Zero out slots already filled by cross-image to avoid re-selecting them

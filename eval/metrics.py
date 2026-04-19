@@ -80,6 +80,11 @@ class GroundingEvaluator:
         self._correct_50:   List[bool]  = []
         self._correct_25:   List[bool]  = []
         self._entity_types: List[str]   = []
+        self._ap_scores:    List[float] = []   # per-phrase AP for mAP50
+        self._recall5:      List[bool]  = []   # any of top-5 correct at IoU≥0.5
+        # Direct box prediction metrics (normalized cxcywh)
+        self._direct_ious:      List[float] = []
+        self._direct_correct_50: List[bool] = []
 
     def set_baseline(self, baseline_acc: float):
         """
@@ -113,16 +118,17 @@ class GroundingEvaluator:
             self._entity_types.append(entity_types[i])
 
     def update_from_indices(self,
-                            pred_idx:     torch.Tensor,   # (B,)
-                            proposals:    torch.Tensor,   # (B, N, 4)
-                            gt_boxes:     torch.Tensor,   # (B, 4)
+                            pred_idx:     torch.Tensor,            # (B,)
+                            proposals:    torch.Tensor,            # (B, N, 4)
+                            gt_boxes:     torch.Tensor,            # (B, 4)
                             entity_types: List[str],
+                            scores:       Optional[torch.Tensor] = None,  # (B, N)
                             ):
         """
         Convert predicted proposal index → box, then call update().
 
-        This is the method called from train.py and evaluate.py.
-        proposals and gt_boxes should both be on CPU before calling.
+        If scores is provided, also computes mAP50 and Recall@5 from the
+        full ranked proposal list. Otherwise those metrics are omitted.
         """
         B         = pred_idx.size(0)
         pred_idx  = pred_idx.cpu()
@@ -131,6 +137,41 @@ class GroundingEvaluator:
 
         pred_boxes = proposals[torch.arange(B), pred_idx]   # (B, 4)
         self.update(pred_boxes, gt_boxes, entity_types)
+
+        if scores is not None:
+            scores = scores.cpu()
+            for i in range(B):
+                ranked = scores[i].argsort(descending=True)  # indices sorted by score
+                gt     = gt_boxes[i]
+                ap     = 0.0
+                r5     = False
+                for rank, idx in enumerate(ranked):
+                    hit = iou(proposals[i, idx], gt) >= self.threshold_high
+                    if hit:
+                        ap = 1.0 / (rank + 1)   # AP = precision at first correct rank
+                        r5 = rank < 5
+                        break
+                self._ap_scores.append(ap)
+                self._recall5.append(r5)
+
+    def update_direct_boxes(self,
+                            pred_boxes_norm: torch.Tensor,   # (B, 4) normalized cxcywh
+                            gt_boxes_norm:   torch.Tensor,   # (B, 4) normalized cxcywh
+                            entity_types:    List[str],
+                            ):
+        """Accumulate metrics for the direct box-prediction head (normalized cxcywh)."""
+        pred_boxes_norm = pred_boxes_norm.cpu()
+        gt_boxes_norm   = gt_boxes_norm.cpu()
+
+        # Convert cxcywh → xyxy for IoU computation
+        def to_xyxy(b):
+            cx, cy, w, h = b[0].item(), b[1].item(), b[2].item(), b[3].item()
+            return torch.tensor([cx - w/2, cy - h/2, cx + w/2, cy + h/2])
+
+        for i in range(pred_boxes_norm.size(0)):
+            score = iou(to_xyxy(pred_boxes_norm[i]), to_xyxy(gt_boxes_norm[i]))
+            self._direct_ious.append(score)
+            self._direct_correct_50.append(score >= self.threshold_high)
 
     # ------------------------------------------------------------------
     # Compute
@@ -171,11 +212,23 @@ class GroundingEvaluator:
         if self._baseline_acc is not None:
             delta = round(overall_50 - self._baseline_acc, 4)
 
-        return {
+        out = {
             "acc@0.5":        round(overall_50,   4),
             "acc@0.25":       round(overall_25,   4),
             "mean_iou":       round(mean_iou_val, 4),
+            "recall@1":       round(overall_50,   4),   # identical to acc@0.5 by definition
             "n_samples":      n,
             "acc_by_type":    acc_by_type,
             "baseline_delta": delta,
         }
+        if self._ap_scores:
+            out["mAP50"]     = round(sum(self._ap_scores) / len(self._ap_scores), 4)
+            out["recall@5"]  = round(sum(self._recall5)   / len(self._recall5),   4)
+        if self._direct_correct_50:
+            out["direct_acc@0.5"] = round(
+                sum(self._direct_correct_50) / len(self._direct_correct_50), 4
+            )
+            out["direct_mean_iou"] = round(
+                sum(self._direct_ious) / len(self._direct_ious), 4
+            )
+        return out
