@@ -91,18 +91,21 @@ class Grounder:
         proposal_crops = _crop_proposals(image, proposals, self.transform)  # (N, 3, H, W)
 
         # --- Tokenize query ---
-        tokens = self.tokenizer(
+        encoding = self.tokenizer(
             query,
             return_tensors="pt",
             padding="max_length",
             truncation=True,
             max_length=77,
-        ).input_ids   # (1, 77)
+        )
+        tokens    = encoding.input_ids        # (1, 77)
+        attn_mask = encoding.attention_mask   # (1, 77)
 
         # --- Build single-item batch ---
         # proposal_mask is all-True (no padding in single-image inference)
         batch = {
-            "phrase_tokens":  tokens.to(self.device),                          # (1, 77)
+            "phrase_tokens":    tokens.to(self.device),                          # (1, 77)
+            "phrase_attn_mask": attn_mask.bool().to(self.device),                  # (1, 77)
             "proposal_crops": proposal_crops.unsqueeze(0).to(self.device),     # (1, N, 3, H, W)
             "proposals":      proposals.unsqueeze(0).to(self.device),          # (1, N, 4)
             "proposal_mask":  torch.ones(1, N, dtype=torch.bool).to(self.device), # (1, N)

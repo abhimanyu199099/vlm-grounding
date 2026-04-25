@@ -72,7 +72,6 @@ def build_demo(ckpt_path: str, device: str = "cpu"):
             "Upload an image and describe an object or region in it. "
             "The model will draw a bounding box around the described entity."
         ),
-        allow_flagging="never",
     )
     return demo
 
